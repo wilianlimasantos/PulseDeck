@@ -1,0 +1,125 @@
+import type { Lang } from "./index";
+
+/**
+ * Messages written by the Rust backend (progress stages, errors, warnings) are Portuguese. For
+ * English they are translated here by pattern; text that matches no rule is shown as received.
+ */
+const RULES: Array<[RegExp, string]> = [
+  // progress stages
+  [/^Preparando$/, "Preparing"],
+  [/^Carregando no motor$/, "Loading into the engine"],
+  [/^Convertendo \.nam → A2L1$/, "Converting .nam → A2L1"],
+  [/^Reamostrando WAV → 48 kHz$/, "Resampling WAV → 48 kHz"],
+  [/^Concluído$/, "Done"],
+  [/^Backup salvo$/, "Backup saved"],
+  [/^Enviando captura\b/, "Sending capture"],
+  [/^Enviando IR\b/, "Sending IR"],
+  [/^Lendo captura (\d+)$/, "Reading capture $1"],
+  [/^Lendo IR (\d+)$/, "Reading IR $1"],
+  [/^Lendo preset (\d+) — (.*)$/, "Reading preset $1 — $2"],
+  [/^Lendo configurações globais$/, "Reading global settings"],
+  [/^Backup lido$/, "Backup read"],
+  [/^Restaurando captura (\d+)$/, "Restoring capture $1"],
+  [/^Restaurando IR (\d+)$/, "Restoring IR $1"],
+  [/^Restaurando preset (\d+) — (.*)$/, "Restoring preset $1 — $2"],
+  [/^Restaurando configurações globais$/, "Restoring global settings"],
+  [/^Backup restaurado$/, "Backup restored"],
+  [/^Analisando preset (\d+)$/, "Analyzing preset $1"],
+  [/^Uso dos slots lido$/, "Slot usage read"],
+  [/^Lendo o preset$/, "Reading the preset"],
+  [/^Lendo a captura$/, "Reading the capture"],
+  [/^Lendo os IRs$/, "Reading the IRs"],
+  [/^Preset lido$/, "Preset read"],
+  [/^Capturas$/, "Captures"],
+  [/^Aplicando o preset$/, "Applying the preset"],
+  [/^Preset carregado$/, "Preset loaded"],
+  // connection / transfer
+  [/^Pedaleira desconectada$/, "Pedal disconnected"],
+  [/^Todos os slots de captura estão ocupados: (?:escolha um para sobrescrever|libere um na Memória da Pedaleira)\.$/, "All capture slots are used: pick one to overwrite (or free one in Pedal Memory)."],
+  [/^Todos os slots de IR estão ocupados: (?:escolha um para sobrescrever|libere um na Memória da Pedaleira)\.$/, "All IR slots are used: pick one to overwrite (or free one in Pedal Memory)."],
+  [/^Slot de captura inválido: (.*)$/, "Invalid capture slot: $1"],
+  [/^Slot de IR inválido: (.*)$/, "Invalid IR slot: $1"],
+  [/^Tipo de arquivo não suportado: (.*)$/, "Unsupported file type: $1"],
+  [/^Slot (\d+) fora do intervalo (.*)$/, "Slot $1 out of range $2"],
+  [/^Preset fora do intervalo (.*)$/, "Preset out of range $1"],
+  [/^Cena fora do intervalo (.*)$/, "Scene out of range $1"],
+  [/^Banco inválido \(use P ou Q\)$/, "Invalid bank (use P or Q)"],
+  [/^Efeito desconhecido: (.*)$/, "Unknown effect: $1"],
+  [/^Amplificadores ficam só na coluna central AMP\.$/, "Amps live only in the central AMP column."],
+  [/^Tipo de slot desconhecido: (.*)$/, "Unknown slot type: $1"],
+  [/^Referência fora de (.*)$/, "Reference out of $1"],
+  [/^Resposta (\w+) inesperada(.*)$/, "Unexpected $1 reply$2"],
+  [/^(\w+): sem resposta da pedaleira \(não incluído\)$/, "$1: no reply from the pedal (not included)"],
+  [/^(.*): CRC32 (?:total )?não confere.*$/, "$1: CRC32 mismatch"],
+  [/^não é um backup PulseDeck (.*)$/, "not a PulseDeck backup $1"],
+  [/^não é um preset PulseDeck(.*)$/, "not a PulseDeck preset$1"],
+  [/^o nome não pode ficar vazio$/i, "the name cannot be empty"],
+  [/^O nome não pode ficar vazio\.$/, "The name cannot be empty."],
+  [/^slot (\d+) está vazio$/, "slot $1 is empty"],
+  [/^Já existe uma pasta com esse nome\.$/, "A folder with that name already exists."],
+  [/^A pasta não está vazia: apague os presets antes\.$/, "The folder is not empty: delete the presets first."],
+  [/^Arquivo fora da biblioteca\.$/, "File outside the library."],
+  [/^Arquivo não encontrado: (.*)$/, "File not found: $1"],
+  [/^Pasta de dados indisponível: (.*)$/, "Data folder unavailable: $1"],
+  [/^Não foi possível criar a biblioteca: (.*)$/, "Could not create the library: $1"],
+  [/^Não foi possível abrir a pasta: (.*)$/, "Could not open the folder: $1"],
+  [/^Não foi possível ler o arquivo: (.*)$/, "Could not read the file: $1"],
+  [/^trim de (.*) dB não reaplicado: (.*)$/, "trim of $1 dB not reapplied: $2"],
+  [/^trim não reaplicado: (.*)$/, "trim not reapplied: $1"],
+  [/^IR (\d+): taxa (.*) kHz não suportada pelo envio \(só 48 kHz\)$/, "IR $1: $2 kHz sample rate not supported for upload (48 kHz only)"],
+  [/^captura (\d+): (.*)$/, "capture $1: $2"],
+  [/^(.*): bloco (.*) não restaurado \((.*)\)$/, "$1: block $2 not restored ($3)"],
+  [/^transferência falhou no byte (\d+): (.*)$/, "transfer failed at byte $1: $2"],
+  [/^o firmware não tem o motor para este formato$/, "the firmware has no engine for this format"],
+  [/^memória insuficiente$/, "not enough memory"],
+  [/^IR não pôde ser enviado$/, "the IR could not be uploaded"],
+  // NAM / WAV conversion
+  [/^Esta captura é NAM A1: .*$/, "This capture is NAM A1: download it again (it now exists as A2)."],
+  [/^Esta captura é NAM LSTM: .*$/, "This capture is NAM LSTM: download the A2 version."],
+  [/^Modelo NAM "(.*)": a pedaleira só executa capturas NAM A2 \(WaveNet\)\.$/, 'NAM model "$1": the pedal only runs NAM A2 (WaveNet) captures.'],
+  [/^Modelo não suportado: (.*)$/, "Unsupported model: $1"],
+  [/^Este \.nam não tem sub-modelos.*$/, "This .nam has no sub-models (invalid SlimmableContainer)."],
+  [/^Os pesos contêm NaN ou infinito\.$/, "The weights contain NaN or infinity."],
+  [/^Número de pesos inesperado: o arquivo tem (\d+), .* precisa de (\d+)\.$/, "Unexpected weight count: the file has $1, an A2-Lite network with this configuration needs $2."],
+  [/^Este arquivo não é um JSON válido.*$/, "This file is not valid JSON, so it is not a .nam capture."],
+  [/^Isto não parece uma captura NAM.*$/, 'This does not look like a NAM capture (no "architecture"/"config").'],
+  [/^Esta captura é de (\d+) Hz; a pedaleira roda a 48 kHz\. .*$/, "This capture is $1 Hz; the pedal runs at 48 kHz. Download the 48 kHz version."],
+  [/^Este modelo precisa de .*$/, "This model needs a bit shift/fraction the pedal engine cannot do: extreme weights or levels."],
+  [/^WAV inválido: (.*)$/, "Invalid WAV: $1"],
+  [/^O WAV está vazio\.$/, "The WAV is empty."],
+  [/^O IR é silencioso.*$/, "The IR is silent."],
+  // Bluetooth
+  [/^Sem permissão para usar o Bluetooth: (.*)$/, "No permission to use Bluetooth: $1"],
+  [/^O Bluetooth está desligado ou bloqueado: (.*)$/, "Bluetooth is off or blocked: $1"],
+  [/^Nenhum adaptador Bluetooth encontrado neste computador\.$/, "No Bluetooth adapter found on this computer."],
+  [/^Dispositivo Bluetooth não encontrado: .*$/, "Bluetooth device not found: turn the pedal on and search again."],
+  [/^Tempo esgotado ao conectar por Bluetooth\.$/, "Timed out connecting over Bluetooth."],
+  [/^O dispositivo não expõe um serviço serial \(UART\) compatível\.$/, "The device does not expose a compatible serial (UART) service."],
+  [/^Conexão Bluetooth perdida( durante o envio)?\.$/, "Bluetooth connection lost."],
+  [/^Emparelhamento não concluído a tempo: .*$/, "Pairing was not completed in time: the pedal stays read-only."],
+  [/^Emparelhamento não concluído \((.*)\): a pedaleira fica em modo só-leitura\.$/, "Pairing not completed ($1): the pedal stays read-only."],
+  [/^(.*) move(?:m)? vários KB e, por Bluetooth, .*Conecte a pedaleira pelo cabo USB para essa operação\.$/s, "$1: this moves several KB and, over Bluetooth, every line is split into small packets: it is very slow and a drop halfway could leave a slot incomplete. Connect the pedal with the USB cable for this operation."],
+  // global settings
+  [/^configuração desconhecida: (.*)$/, "unknown setup: $1"],
+  [/^opção desconhecida: (.*)$/, "unknown option: $1"],
+  [/^valor inválido para (.*)$/, "invalid value for $1"],
+  [/^cor inválida \(use rrggbb\)$/, "invalid color (use rrggbb)"],
+  [/^banda (\d+) fora de (.*)$/, "band $1 out of $2"],
+];
+
+/** The operation names `require_fast_link` puts in front of the Bluetooth warning. */
+const WHAT: Array<[string, string]> = [
+  ["Capturas (.nam) e IRs (.wav)", "Captures (.nam) and IRs (.wav)"],
+  ["A restauração de backup", "Restoring a backup"],
+  ["O backup completo", "The full backup"],
+  ["Renomear um slot (reenvia o arquivo)", "Renaming a slot (re-uploads the file)"],
+  ["Carregar um pacote da biblioteca", "Loading a library package"],
+  ["Salvar na biblioteca (lê capturas e IRs da pedaleira)", "Saving to the library (reads captures and IRs from the pedal)"],
+];
+
+export function localizeBackend(text: string, lang: Lang): string {
+  if (lang === "pt-BR" || !text) return text;
+  if (text.includes("vários KB")) for (const [pt, en] of WHAT) if (text.startsWith(pt)) { text = en + text.slice(pt.length); break; }
+  for (const [re, out] of RULES) if (re.test(text)) return text.replace(re, out);
+  return text;
+}

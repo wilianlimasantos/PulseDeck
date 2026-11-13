@@ -1,0 +1,2628 @@
+{
+  "document": {
+    "title": "Tank-G / Tank-B UltraRig firmware: host <-> pedal control protocol",
+    "purpose": "Clean technical description of the wire protocol observed in the control page (web/tankg.html, web/nam2chip.js). No source, UI text or assets reproduced.",
+    "scope_notes": [
+      "Applies to the alternative firmware (UltraRig, firmware tag 'M5.x'). The factory M-VAVE firmware uses USB-MIDI/USB-audio instead and is NOT covered by this protocol.",
+      "Derived by static reading of the page; nothing was executed against a real pedal. Effect table comes from the page's built-in reference catalog (ids 1..39); the pedal itself is the authority and returns its own table with the FXT command (see effects.runtime_discovery).",
+      "Field meanings marked '(unverified)' are inferred from how the page parses them."
+    ]
+  },
+  "transport": {
+    "type": "USB CDC-ACM virtual serial port, accessed via the Web Serial API (no SysEx, no MIDI)",
+    "usb_vendor_id": "0x3654",
+    "usb_product_id": "not filtered by the page (any PID with vendor 0x3654; the page stores the last vid/pid it used and prefers it on reconnect)",
+    "serial_settings": {
+      "baud_rate": 115200,
+      "note": "CDC: baud is nominal. Data/stop/parity/flow control left at Web Serial defaults (8N1, none)."
+    },
+    "os_enumeration": "Windows shows 'USB Serial Device (COMn)' using the inbox driver.",
+    "detection": [
+      "Open the port picker with filter {usbVendorId: 0x3654}, or reuse an already-authorised port: prefer the stored vid/pid, else first port with VID 0x3654, else the only authorised port.",
+      "Open at 115200 baud (page times out the open after 5 s).",
+      "Send PING up to 5 times with a 700 ms reply timeout each; the first line starting with 'PONG' identifies the pedal. No PONG = not this firmware / wrong port.",
+      "Hot-plug: listen to serial 'connect'/'disconnect' events to auto-reconnect after a pedal reboot."
+    ],
+    "alternative_transport": {
+      "type": "Bluetooth LE, Nordic UART Service, same text lines",
+      "service_uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+      "rx_characteristic_host_writes": "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+      "tx_characteristic_pedal_notifies": "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+      "pairing_characteristic": "6e400004-b5a3-f393-e0a9-e50e24dcca9e",
+      "device_name_prefix": "UltraRig",
+      "note": "Writes are split into MTU-3 byte pieces (20 if not negotiated). Unpaired central is read-only: pedal answers 'ERR <cmd> pair'.",
+      "host_settings": {
+        "note": "Choices of the PulseDeck host, not part of the pedal protocol. Only the Nordic UART service above is documented for this pedal; the extra names / services are generic fallbacks for UART-over-GATT bridges and have NOT been verified against a pedal.",
+        "name_filters": ["UltraRig", "Tank-G", "Tank-B", "M-VAVE"],
+        "extra_service_uuids": ["0000ae00-0000-1000-8000-00805f9b34fb", "0000fff0-0000-1000-8000-00805f9b34fb"],
+        "scan_ms": 5000,
+        "connect_timeout_ms": 15000,
+        "pair_read_timeout_ms": 30000,
+        "chunk_default_bytes": 20,
+        "chunk_max_bytes": 244,
+        "chunk_delay_ms": 12,
+        "heavy_transfer": "Capture (.nam -> A2L1) and IR (.wav) uploads, backups and restores move many KB as hex lines acknowledged one by one: over BLE they are slow (every line is split into 20-byte writes). The host warns and recommends the USB cable."
+      }
+    },
+    "factory_firmware_detection_note": "The page probes Web MIDI (requestMIDIAccess without sysex) only to tell a user the pedal still runs factory firmware; it never sends control data over MIDI."
+  },
+  "framing": {
+    "encoding": "ASCII text, one command per line",
+    "line_terminator_host_to_pedal": "\\n (0x0A)",
+    "line_terminator_pedal_to_host": "\\n, optionally preceded by \\r (host strips a trailing \\r); blank lines ignored",
+    "checksum": "none on command lines. CRC32 is used only to verify binary uploads (LDEND / IREND).",
+    "max_command_line_chars_excluding_newline": {
+      "firmware_ge_M4.83": 190,
+      "firmware_lt_M4.83": 31,
+      "absolute_firmware_limit": 199,
+      "how_host_learns_version": "from the PONG line"
+    },
+    "tokenisation": "space separated; first token = command name (case-sensitive, upper case). Names/strings are plain ASCII without quotes; the pedal replaces non-ASCII bytes with '_'.",
+    "flow_control": "strictly one command in flight. Host sends a line, then collects reply lines until a terminating line is seen or a timeout expires (default 1500 ms; slow commands 2.5-12 s, see each command). Any line received while nothing is pending is discarded.",
+    "reply_termination": "Each command has a terminal prefix (e.g. 'FXP', 'PLOAD'). A line starting with 'ERR' also terminates. Multi-line replies end with a sentinel line ('FXT end', 'FXS peak=...', 'PLIST end ...', ...). Older firmware used 'fin' for 'end' and 'pico' for 'peak'; hosts accept both.",
+    "error_format": "ERR <COMMAND> <reason text>   e.g. 'ERR FXA not enough CPU', 'ERR FXA out of memory', 'ERR FXA bank full', 'ERR FXL too many parallel groups (max 3 per bank)', 'ERR FXA bad argument', 'ERR PLOAD empty or invalid slot', 'ERR SNAP empty slot'",
+    "asynchronous_lines": {
+      "rule": "Lines beginning with '@' are unsolicited pushes and are never a command reply.",
+      "@L": "level/cpu meter push, enabled with 'LVLSUB <mode>'. Fields: @L <in_dB10> <out_dB10> <cpu_used>/<cpu_budget> <engine_used>/<limit> <lr> <gen> [<capture_in>]  (unverified order beyond the regex used)",
+      "@K": "knob / footswitch changes made on the pedal itself (parameter, on/off, amp-EQ, saved-slot reports)",
+      "other_unsolicited": [
+        "NOISE ms=...  (reply to NOISE)",
+        "CALIB ... (one line ~every 3 s while calibration runs)",
+        "ERR CALIB stopped ..."
+      ]
+    }
+  },
+  "conventions": {
+    "banks": "Block chain is two lists: P (before the amp/capture block) and Q (after it). Max 10 blocks per bank, 16 in total, 7 parameters per block, 3 parallel groups per bank.",
+    "block_instance_id": "Each block instance has a numeric id (id=) assigned by the pedal when added. All edit commands address the instance id, NOT its position or its effect type id.",
+    "lanes": "lane 0 = serial, 1 = parallel branch A, 2 = parallel branch B. A contiguous run of blocks with lane 1/2 forms one parallel group (numbered 0.. within its bank, in order).",
+    "amp_block": "The amp is the NAM capture slot, not an FX type. It marks the P/Q boundary and is controlled with AMP / AMPX.",
+    "preset_slots": "32 presets, slot 0..31. Display convention: bank = floor(slot/4)+1, letter = A..D for slot%4.",
+    "scenes": "Each preset has 4 scenes (a.k.a. snapshots) 0..3.",
+    "capture_slots": 15,
+    "ir_slots": 8,
+    "number_formats": "decimal integers (signed where noted); hex only for CRC32 (8 lowercase hex digits) and binary payload bytes (2 lowercase hex digits per byte, no separators); colours are 6 hex digits rrggbb."
+  },
+  "commands": {
+    "handshake_and_state_read": {
+      "PING": {
+        "request": "PING",
+        "reply": "PONG <fw_name> <fw_version> [flags...] <Mon> <dd> <yyyy> ...",
+        "reply_example_shape": "PONG tankg_fw M5.26 rel amx ble tankb v1 <build date>",
+        "terminator": "line starting 'PONG'",
+        "timeout_ms": 700,
+        "parsing": {
+          "version": "regex ^PONG (.+?) \\w{3} [ \\d]\\d \\d{4}  (group 1 = '<name> <version> <flags...>' before the build date)",
+          "firmware_number": "token 'M<major>.<minor>' -> major*100+minor (used for feature gating: >=452 has EVT log, >=483 allows 190-char lines)",
+          "flags_in_group_1": {
+            "amx": "firmware includes AM2/AM3/AM4 engine",
+            "ble": "has Bluetooth",
+            "tankb": "Tank-B (bass) build; absent = Tank-G",
+            "v1": "board v1; absent = board v2",
+            "+diag": "diagnostic build"
+          },
+          "trailing_flag": "' safe' at end of the whole line = started in safe mode"
+        }
+      },
+      "initial_sync_sequence_used_by_host": [
+        "PING",
+        "BLE (only if flag ble; reply 'BLE ... mtu=N ...' bond info)",
+        "FXT",
+        "MODEL",
+        "MEM",
+        "FXS (+FXMIX when parallel groups exist)",
+        "PLIST",
+        "SNAPS",
+        "SNAPNAME",
+        "LVL",
+        "AMPEQ (query form)",
+        "STW",
+        "global settings reads (GEQ/HPF/SPILL/GLIDE/SPUR/LIM/FSA/FSPRESS/FSMODE/FSLED/LEDCFG/PCOLOR are read-back forms of the same commands)",
+        "then LVLSUB / LVL polling every 250 ms"
+      ],
+      "FXT": {
+        "request": "FXT",
+        "purpose": "Dump the effect-type catalog (ids, names, parameter ranges).",
+        "reply_lines": [
+          "FXT <type_id> <name> cost=<cpu_ticks> [cat=<category>] [mem=<bytes>] [memmax=<bytes>] [pcmax=<bytes>]",
+          "FXT <param_index> <param_name> <min>..<max> (<default>)      (one per parameter, follows its type line)",
+          "FXT os tiers=<off>,<normal>,<high> [cost=<a>,<b>,<c>]       (oversampling values of that type)",
+          "FXT pp modes=<n>,<n>                                         (pitchpro mode values)",
+          "FXT end"
+        ],
+        "terminator": "FXT end",
+        "timeout_ms": 3000
+      },
+      "FXS": {
+        "request": "FXS",
+        "purpose": "Dump the current chain.",
+        "reply_lines": [
+          "FX <P|Q><position> id=<instance_id> <type_name> on=<0|1> p=<v0,v1,...> ticks=<cpu> [l=<lane>] [g=<group>] [fu=<n>] [irlen=<samples>/<kHz>] [mem=<bytes>] [pcs=<pieces>]",
+          "FXMIX <P|Q> <group> <levelA_dB> <levelB_dB>",
+          "FXXO <P|Q> <group> <crossover_Hz or 0> [<equal_gain 0|1>]",
+          "FXS amp=<present 0|1> [on=<0|1>]",
+          "FXS cpu=<used>/<budget> ticks (<pct>%) mem_fx=<bytes>",
+          "FXS peak=<n> ticks skipped=<n>"
+        ],
+        "terminator": "line starting 'FXS peak' (legacy 'FXS pico')",
+        "timeout_ms": 2500,
+        "note": "p= lists raw parameter values in parameter-index order for that block's type."
+      },
+      "LVL": {
+        "request": "LVL",
+        "reply": "LVL in=<dB10> out=<dB10> ci=<clips> co=<clips> fx=<used>/<budget> mem=<n> sk=<skips> m=<mode> g=<in_dB>/<out_dB> [ce=..] [a=<amp_on> e=<used>/<budget> am=<arena>] [b=<bpm10> s=<scene>] [c=<chain_generation> p=<preset>] [tu=<0|1>] [fm=<layout>,<live>,<bank>,<bypass>] [cin=<n> ctg=<n>] [stuck=<0|1>] [bat=...]",
+        "use": "c= is a change counter: when it changes the host re-reads FXS. p= is the current preset (-1 none). s= current scene (-1 none).",
+        "timeout_ms": 800
+      },
+      "LVLSUB": {
+        "request": "LVLSUB <mode>",
+        "effect": "Enable unsolicited '@L' meter lines (mode value not fully determined; host re-asks with 'LVLSUB' on connect and falls back to LVL polling if unsupported)."
+      },
+      "MODEL": {
+        "request": "MODEL",
+        "reply": "MODEL '<capture name>' layers=<n> [engine=AM2|AM3|AM4] [trim=.. lvl=..]",
+        "note": "Currently loaded capture."
+      },
+      "MEM": {
+        "request": "MEM",
+        "reply": "MEM ... free=<bytes> effects=<bytes> fxcap=<bytes> [lent=<n>] [lendable=<n>] [fit=<bytes>] [fitsum=<bytes>] [fits=<type_id>:<0|1>,...]",
+        "timeout_ms": 3000
+      },
+      "STW": {
+        "request": "STW [<0..100>]",
+        "reply": "STW w=<n> cur=<n> live=<0|1> [cpu=<used>/<budget>] [deg=<0|1>]",
+        "note": "Stereo-headphone width switch of the preset (firmware with stereo support only; others answer ERR STW)."
+      }
+    },
+    "preset_and_scene": {
+      "PLIST": {
+        "request": "PLIST",
+        "reply_lines": [
+          "PRE <slot 0..31> <block_count> <int> <int> '<name up to 23 chars>' [t=<-|p<id>[a|b],q<id>[a|b],...>] [s=<scene_bitmask>] [col=<rrggbb>] [amp=<0|1>]",
+          "PLIST end current=<slot or -1>"
+        ],
+        "terminator": "PLIST end",
+        "timeout_ms": 4000,
+        "validity": "Host re-issues up to 3 times if lines are missing/garbled (slot out of 0..31, out of order, name >23 chars, current slot absent from list)."
+      },
+      "PLOAD": {
+        "request": "PLOAD <slot 0..31>",
+        "reply": "PLOAD ok ... missing=<blocks that did not fit> ... ms=<n> [capture_err='<text>']",
+        "terminator": "line starting 'PLOAD'",
+        "timeout_ms": 8000,
+        "after": "host re-reads FXS, SNAPS, SNAPNAME, MODEL, STW, AMPEQ, MEM and LVL"
+      },
+      "PSAVE": {
+        "request": "PSAVE <slot 0..31> <name up to 23 chars>",
+        "reply": "PSAVE ok ... capture=<slot or -1>",
+        "timeout_ms": 8000,
+        "effect": "Writes the currently sounding chain (not scenes) + capture reference to flash slot; the pedal becomes 'in' that slot."
+      },
+      "PNEW": {
+        "request": "PNEW",
+        "reply": "PNEW ok",
+        "effect": "Empty chain, no current preset (p=-1)."
+      },
+      "PNAME": {
+        "request": "PNAME <slot> <name>",
+        "reply": "PNAME ok <slot> '<name>'",
+        "effect": "Rename in flash only; query form 'PNAME' (no args) answers a usage ERR on firmware that has it."
+      },
+      "PDEL": {
+        "request": "PDEL <slot>",
+        "effect": "Delete preset (exact reply not observed)."
+      },
+      "PCOLOR": {
+        "request": "PCOLOR <rrggbb|none>",
+        "reply": "PCOLOR <rrggbb|none> preset=<slot>",
+        "note": "Query form: 'PCOLOR'."
+      },
+      "SNAPS": {
+        "request": "SNAPS",
+        "reply": "SNAPS <b0><b1><b2><b3> current=<scene or -1>",
+        "note": "b = 1 if that scene is stored."
+      },
+      "SNAP": {
+        "request": "SNAP <scene 0..3>",
+        "reply": "SNAP ok <scene> missing=<n> ms=<n>",
+        "errors": [
+          "ERR SNAP empty slot"
+        ],
+        "effect": "Switch to that scene (applies stored per-block on/off, parameter values, input/output gain, amp on, amp EQ). Prefix match must use 'SNAP ' with trailing space to avoid SNAPS/SNAPSAVE."
+      },
+      "SNAPSAVE": {
+        "request": "SNAPSAVE <scene 0..3>",
+        "reply": "SNAPSAVE ok <scene> preset=<slot or -1>",
+        "effect": "Store current state as that scene inside the current preset (flash write if preset>=0)."
+      },
+      "SNAPNAME": {
+        "request": "SNAPNAME <scene> <name up to 15 chars>  |  SNAPNAME",
+        "reply_set": "SNAPNAME ok <scene> '<name>' preset=<slot>",
+        "reply_list": [
+          "SNAPNAME <scene> '<name>'  x4",
+          "SNAPNAME end"
+        ]
+      },
+      "SNAPDEL": {
+        "request": "SNAPDEL <scene>",
+        "effect": "Delete a stored scene."
+      },
+      "BPM": {
+        "request": "BPM <tempo_x10 400..3000>",
+        "reply": "BPM <int>.<tenths>",
+        "note": "TAP tempo is computed on the host; query form 'BPM'."
+      },
+      "GAIN": {
+        "request": "GAIN <input_dB> <output_dB>",
+        "range_dB": [
+          -30,
+          12
+        ],
+        "reply": "GAIN in=<n> out=<n> dB",
+        "note": "Part of the scene snapshot. Query form 'GAIN'."
+      },
+      "TUNER": {
+        "request": "TUNER <on 0|1> <mute 0|1> <ref_Hz>",
+        "reply": "TUNER <on> mute=<m> ref=<hz>",
+        "note": "Query form 'TUNER'. ref_Hz is an integer (A4 reference, 440 by default; the UI allows 432..445). 'TUNER 0' leaves tuner mode. mute=1 silences the output while tuning."
+      },
+      "TUNE": {
+        "request": "TUNE",
+        "reply_lines": [
+          "TUNE <note><octave> hz=<f> cents=<+-n.n> [level=<dB x10>] [ons=<n>]",
+          "TUNE <no note: reply without a note name when no pitch is detected>",
+          "TUNE off"
+        ],
+        "timeout_ms": 600,
+        "terminator": "first token 'TUNE' (not to be confused with the 'TUNER' reply)",
+        "note": "Poll while tuner mode is on (the reference page polls about every 25 ms, one command in flight). <note> is a letter A..G with an optional '#', <octave> an integer (A4 = 440 Hz). 'TUNE off' means the pedal left tuner mode by itself (footswitch). level is the input level in dB x10 (-1400 or lower = silence). ons increments on each new note onset. DERIVED from the reference web page's parser, not verified against a pedal."
+      }
+    },
+    "block_editing": {
+      "block_on_off": {
+        "request": "FXE <instance_id> <0|1>",
+        "reply": "FXE ok cpu=<used>/<budget> ticks (<pct>%)",
+        "errors": [
+          "ERR FXE not enough CPU",
+          "ERR FXE bad argument"
+        ],
+        "timeout_ms": 1500,
+        "note": "One FXE per block. The amp/capture block uses AMP instead."
+      },
+      "amp_on_off": {
+        "request": "AMP <0|1>",
+        "reply": "AMP <0|1>",
+        "errors": [
+          "ERR AMP not enough CPU (needs <n>)"
+        ]
+      },
+      "amp_remove_or_add": {
+        "request": "AMPX <0|1>",
+        "reply": "AMPX <present> <n_blocks_in_P>",
+        "note": "0 removes the capture block (its memory goes to effects); 1 re-adds it at the P/Q boundary."
+      },
+      "change_effect_model_of_block": {
+        "note": "No in-place type change command exists. The host replaces a block by: FXR <id>  ->  FXA <bank> <position> <new_type_name>, then restores parameters (FXP), lane (FXL) and on/off (FXE) on the new instance id. On failure it re-adds the old type.",
+        "FXR": {
+          "request": "FXR <instance_id>",
+          "reply": "FXR ...",
+          "effect": "Remove block."
+        },
+        "FXA": {
+          "request": "FXA <P|Q> <position, 99 = append> <type_name>",
+          "reply_lines": [
+            "FXA id=<new_instance_id> <type_name>",
+            "FX cpu=<used>/<budget> ticks (<pct>%) mem_fx=<bytes>"
+          ],
+          "terminator": "line starting 'FX cpu' or 'ERR FXA'",
+          "timeout_ms": 4000,
+          "errors": [
+            "ERR FXA bank full",
+            "ERR FXA not enough CPU",
+            "ERR FXA out of memory",
+            "ERR FXA out of memory: all 4 reverb2 states are in use",
+            "ERR FXA no IR loaded",
+            "ERR FXA bad argument"
+          ],
+          "default_parameters": "New block starts with the defaults from the FXT table."
+        },
+        "FXM": {
+          "request": "FXM <instance_id> <P|Q> <position>",
+          "effect": "Move block (reorder / move across the amp)."
+        },
+        "FXL": {
+          "request": "FXL <instance_id> <0|1|2>",
+          "reply": "FXL ok <id> <lane>",
+          "effect": "Set serial / branch A / branch B.",
+          "errors": [
+            "ERR FXL too many parallel groups (max 3 per bank)"
+          ]
+        },
+        "FXMIX": {
+          "request": "FXMIX <P|Q> <group> <levelA_dB> <levelB_dB>",
+          "range_dB": [
+            -60,
+            6
+          ],
+          "reply": "FXMIX <bank> <group> <a> <b>",
+          "note": "Query form 'FXMIX' lists all groups ending 'FXMIX end'."
+        },
+        "FXXO": {
+          "request": "FXXO <P|Q> <group> <crossover_Hz> <equal_gain 0|1>",
+          "range_Hz": "0 (off) or 40..1000 in steps of 10",
+          "reply": "FXXO <bank> <group> <hz> <eq>"
+        }
+      },
+      "set_parameter_value": {
+        "request": "FXP <instance_id> <parameter_index> <value>",
+        "reply": "FXP ok <value_actually_applied>",
+        "errors": [
+          "ERR FXP bad argument",
+          "ERR FXP not enough CPU"
+        ],
+        "timeout_ms": 1500,
+        "value_rule": "Integer in the parameter's [min,max] from the effect table; the pedal clamps and echoes the stored value. Units/encodings: see parameter_encodings. Sent live while a knob moves; no flash write until PSAVE/SNAPSAVE.",
+        "knobs_of_same_block_may_be_sent_back_to_back": "yes, one command at a time"
+      },
+      "oversampling": {
+        "request": "FXOS <instance_id> <tier 0..3>",
+        "reply": "FXOS ok id=<id> <type> os=<n> lat=<n> cost=<n> ticks=<n>",
+        "note": "Convenience for the os_n parameter of nonlinear blocks."
+      },
+      "block_ir_selection": {
+        "request": "FXIR <instance_id> <ir_slot or -1>",
+        "reply": "FXIR ok <id> <slot>",
+        "note": "-1 = use the shared preset IR. Stored in the block's ir_slot parameter as slot+1 (0 = shared). Timeout 8000 ms."
+      },
+      "amp_eq": {
+        "request": "AMPEQ <volume> <bass> <mid> <treble> <presence> [<gain>]",
+        "reply": "AMPEQ volume=<n> bass=<n> mid=<n> treble=<n> presence=<n> drive=<n>",
+        "ranges": {
+          "volume": [
+            -240,
+            120
+          ],
+          "bass": [
+            -120,
+            120
+          ],
+          "mid": [
+            -120,
+            120
+          ],
+          "treble": [
+            -120,
+            120
+          ],
+          "presence": [
+            -120,
+            120
+          ],
+          "drive": [
+            -120,
+            120
+          ]
+        },
+        "unit": "dB x10 (unverified; page labels it 'dB10')",
+        "query_forms": [
+          "AMPEQ",
+          "AMPEQ info (returns centre frequencies/limits on newer firmware)"
+        ],
+        "scope": "per preset and per scene"
+      }
+    },
+    "global_settings": {
+      "GSAVE": {
+        "request": "GSAVE",
+        "reply": "GSAVE ok ...",
+        "timeout_ms": 5000,
+        "effect": "Persist global settings (below) to flash. Until then they are live but unsaved."
+      },
+      "settings_commands_saved_by_GSAVE": {
+        "GEQ": "GEQ <band> <value>  (global output EQ bands)",
+        "HPF": "HPF <hz>  -> 'HPF hz=<n>' (input high-pass)",
+        "SPILL": "SPILL <0|1>  (spillover)",
+        "GLIDE": "GLIDE <ms> <0|1> -> reply contains 'snap=<0|1>' (scene transition glide)",
+        "SPUR": "SPUR <0|1>",
+        "LIM": "LIM <on 0|1> <threshold> <release>  -> 'LIM ...'",
+        "FSA": "FSA <footswitch 0..3> <gesture 0..2> <action args...>  (query 'FSA' ends with 'FSA end')",
+        "FSPRESS": "FSPRESS <footswitch> <value>  -> 'FSPRESS a b c d'",
+        "FSMODE": "FSMODE layout=<factory|scenes|custom>  -> 'FSMODE layout=..'",
+        "FSLED": "FSLED <footswitch> ...  (query ends 'FSLED end')",
+        "LEDCFG": "LEDCFG <key>=<value> keys: bright tuner tap meter hold anim idle"
+      },
+      "read_back_shapes": {
+        "GEQ": "'GEQ' -> one line 'GEQ <b0> <b1> <b2> <b3> <b4>' (integer dB); 'GEQ <band> <dB>' sets one band",
+        "HPF": "'HPF' -> 'HPF hz=<n>'",
+        "FSA": "'FSA' -> 12 lines 'FSA <fs> <gesture> <type> <a> <b> [id=<x>,<y>]' then 'FSA end'. Gestures: 0 tap, 1 hold, 2 double. Host sets with 'FSA <fs> <gesture> <type> <a> <b>'.",
+        "FSMODE": "'FSMODE' -> 'FSMODE layout=<factory|scenes|custom> mode=<preset|live> bank=<n> bypass=<0|1>'; 'FSMODE layout=<..>' sets. Send the FSA lines BEFORE the layout.",
+        "FSLED": "'FSLED' -> 4 lines 'FSLED <fs> <auto|custom> on=<rrggbb> off=<rrggbb>' then 'FSLED end'; set: 'FSLED <fs> auto' or 'FSLED <fs> <on rrggbb> <off rrggbb>'",
+        "LEDCFG": "'LEDCFG' -> 'LEDCFG bright=<0..100> tuner=<off|needle|strobe> tap=<0..2> meter=<off|edit|always> hold=<0|1> anim=<0|1> idle=<0|30|60|120>'"
+      },
+      "host_ui": {
+        "note": "Value ranges and presets the host UI offers. Ranges come from the reference page's controls; the firmware is the authority. The pedal has NO global volume / cab command and NO bypass for the global EQ (all bands at 0 dB is flat): the host emulates bypass by flattening the bands and remembering the values.",
+        "geq": { "bands_hz": [100, 400, 1200, 3200, 7000], "min_db": -12, "max_db": 12 },
+        "hpf": { "off": 0, "min_hz": 20, "max_hz": 120, "step_hz": 5 },
+        "led": {
+          "bright": { "min": 0, "max": 100, "step": 5 },
+          "tuner": ["off", "needle", "strobe"],
+          "tap": [0, 1, 2],
+          "meter": ["off", "edit", "always"],
+          "hold": [0, 1],
+          "anim": [0, 1],
+          "idle": [0, 30, 60, 120],
+          "default_on_colors": ["28beff", "28ff5a", "ffaa1e", "e63cff"],
+          "dim_divisor": 24,
+          "palette": ["28beff", "28ff5a", "ffaa1e", "e63cff", "ff3b30", "ffffff", "ffe14a", "ff6ec7", "7a5cff", "00e5c0"]
+        },
+        "footswitch_quick_setups": [
+          { "key": "factory", "label": "Fábrica", "desc": "Os footswitches funcionam como no firmware original da M-VAVE. Suas ações próprias ficam guardadas.", "layout": "factory", "actions": null },
+          { "key": "scenes", "label": "Modo Cena", "desc": "Footswitches 1–4 chamam as cenas 1–4 (segurar: ações extras).", "layout": "scenes",
+            "actions": [[[1,0,255],[4,0,255],[0,0,255]],[[1,1,255],[9,0,255],[0,0,255]],[[1,2,255],[7,0,255],[0,0,255]],[[1,3,255],[3,0,255],[0,0,255]]] },
+          { "key": "presets", "label": "Modo Preset", "desc": "1–2 trocam o preset, 3 troca a cena e 4 é tap tempo.", "layout": "custom",
+            "actions": [[[4,0,255],[0,0,255],[0,0,255]],[[3,0,255],[0,0,255],[0,0,255]],[[5,0,255],[6,0,255],[0,0,255]],[[7,0,255],[9,0,255],[0,0,255]]] },
+          { "key": "stompbox", "label": "Stompbox", "desc": "1–3 ligam e desligam blocos da cadeia; 4 é tap tempo.", "layout": "custom",
+            "actions": [[[8,0,255],[1,0,255],[0,0,255]],[[8,1,255],[1,1,255],[0,0,255]],[[8,2,255],[1,2,255],[0,0,255]],[[7,0,255],[9,0,255],[0,0,255]]] }
+        ]
+      }
+    },
+    "capture_library": {
+      "CLIST": {
+        "request": "CLIST",
+        "reply_lines": [
+          "CAP <slot> <bytes> '<name>' [trim=<dB>] [in=<dBu>]",
+          "CLIST end current=<slot> slots=15"
+        ],
+        "terminator": "CLIST end",
+        "timeout_ms": 4000
+      },
+      "CLOAD": {
+        "request": "CLOAD <slot>",
+        "reply": "CLOAD ok <slot> audio=<mode>",
+        "timeout_ms": 8000,
+        "errors": [
+          "ERR CLOAD empty or invalid slot"
+        ]
+      },
+      "CDEL": {
+        "request": "CDEL <slot>",
+        "timeout_ms": 5000
+      },
+      "CREAD": {
+        "request": "CREAD <slot> [<offset>]",
+        "reply_info": "CREAD <slot> len=<n> crc=<hex8> id=<hex8> aux=0 fs=0 name='<name>'",
+        "reply_chunk": "CREAD <slot> <offset> <len<=96> <crc32_hex8> <base64>",
+        "note": "Read-back of a stored capture in 96-byte pieces (newer firmware)."
+      },
+      "CTRIM": {
+        "request": "CTRIM <slot|live> <trim_dB step 0.5, -12..12> [<input_level_dBu x10 | ->]",
+        "reply": "CTRIM ok slot=<n> trim=<dB> saved=<0|1>",
+        "timeout_ms": 8000,
+        "note": "With 'live' the trim is applied to the sounding capture only; with a slot number it is written to the slot header."
+      }
+    },
+    "ir_library": {
+      "ILIST": {
+        "request": "ILIST",
+        "reply_lines": [
+          "IRS <slot> <bytes> '<name>' fs=<kHz>",
+          "ILIST end current=<slot> slots=8"
+        ],
+        "terminator": "ILIST end"
+      },
+      "ILOAD": {
+        "request": "ILOAD <slot>",
+        "reply": "ILOAD ok <slot>",
+        "timeout_ms": 8000
+      },
+      "IDEL": {
+        "request": "IDEL <slot>",
+        "timeout_ms": 5000
+      },
+      "IREAD": {
+        "request": "IREAD <slot> [<offset>]",
+        "note": "Same shape as CREAD."
+      }
+    }
+  },
+  "file_transfer": {
+    "common": {
+      "mechanism": "Same text transport. Binary is hex-encoded (2 lowercase hex chars/byte), one chunk per command line, each acknowledged before the next is sent (stop-and-wait). Sequence: BEGIN -> N x chunk -> END(crc) -> optional SAVE to slot.",
+      "chunk_line": "<PREFIX> <byte_offset_decimal> <hex_bytes>",
+      "chunk_ack": "OK <PREFIX> <byte_offset> <bytes_written>   (host checks the last number equals the chunk size and that the reply starts with 'OK <PREFIX> <offset> '; any ERR or mismatch aborts: 'transfer failed at byte <offset>')",
+      "chunk_ack_timeout_ms": 1500,
+      "chunk_size_bytes": "floor((min(max_line_chars,199) - len(PREFIX) - 2 - len(str(total_length))) / 2). At max_line_chars=190 and PREFIX of 3 chars this is ~90 bytes per line; at 31 (old firmware) 10-11 bytes.",
+      "crc32": {
+        "algorithm": "CRC-32/ISO-HDLC (zlib): poly 0xEDB88320 reflected, init 0xFFFFFFFF, final XOR 0xFFFFFFFF",
+        "computed_over": "the whole uploaded byte stream (for a capture that includes the blob's own trailing CRC field)",
+        "format_on_wire": "8 lowercase hex digits, zero padded"
+      },
+      "slot_addressing": "The upload goes into a RAM staging buffer first (NOT a slot). The slot is chosen only by the final SAVE command (CSAVE / ISAVE). Without SAVE the item just plays (capture) / is used by the shared IR and is lost when another is loaded.",
+      "cleanup_on_failure": "Release the staging buffer with 'LDBEGIN 0' (capture) or 'IRBEGIN 0 0 48' (IR; may answer ERR on older firmware). Re-enable audio with 'AUDIO A2L' if it was on."
+    },
+    "capture_nam": {
+      "source_file": ".nam (NAM A2 'Lite' WaveNet). Must be converted on the host to the pedal's native 'A2L1' blob first (see a2l1_blob_format). A ready .a2l file is sent as is.",
+      "steps": [
+        {
+          "cmd": "AUDIO OFF",
+          "reply": "AUDIO <mode 0>",
+          "timeout_ms": 5000,
+          "note": "Mute engine during upload (remember previous mode: 2 = capture engine running)."
+        },
+        {
+          "cmd": "LDBEGIN <total_bytes>",
+          "reply": "OK LDBEGIN <total_bytes>",
+          "errors": [
+            "ERR LDBEGIN length <n> (max 8192)  <- as mirrored by the page's built-in device simulator; real limit for A2L blobs not verified"
+          ],
+          "note": "'LDBEGIN 0' releases the buffer."
+        },
+        {
+          "cmd": "LDB <offset> <hex>",
+          "repeat": "until all bytes sent, offsets strictly increasing, contiguous",
+          "reply": "OK LDB <offset> <len>",
+          "errors": [
+            "ERR LDB no upload",
+            "ERR LDB offset"
+          ]
+        },
+        {
+          "cmd": "LDEND <crc32_hex8>",
+          "reply": "LOAD rc=<code> name='<n>' layers=<n> channels=<n> audio=<mode> engine=<A2L|AMx> ms=<n>",
+          "timeout_ms": {
+            "A2L": 10000,
+            "AMx": 60000
+          },
+          "success": "rc=0",
+          "rc_meaning": {
+            "0": "ok",
+            "-4": "blob rejected by parser/validator",
+            "-2,-3,-21": "engine for this format not in firmware (AMx)",
+            "-100": "not enough memory"
+          },
+          "note": "If the reply says audio<>2 and audio had been on, send 'AUDIO A2L' (timeout 12000 ms)."
+        },
+        {
+          "cmd": "CTRIM live 0 <input_level_dBu x10>",
+          "optional": true,
+          "reply": "CTRIM ok slot=-1 trim=0.0 saved=0",
+          "note": "Only if the .nam metadata gave an input level in -20..40 dBu; stored into the slot header by the following CSAVE."
+        },
+        {
+          "cmd": "CSAVE <slot 0..14> <name up to 23 ASCII chars>",
+          "reply": "CSAVE ok <slot> '<name>' <bytes> B",
+          "timeout_ms": 8000,
+          "note": "Name is ASCII only (non-ASCII replaced with '_')."
+        }
+      ]
+    },
+    "capture_amx_passthrough": {
+      "note": "On firmware with flag 'amx': .am2/.am3/.am4 (+Data) files are sent unchanged using the same LDBEGIN/LDB/LDEND/CSAVE sequence (LDEND timeout 60 s). Magic 'AM2'|'AM3'|'AM4' at byte 0, byte 3 = 0, size <= 8192. A raw 6144-byte .am2 gets a 60-byte header prepended: 'AM2\\0', name[13+], tuning bytes at 0x12..0x15 = 100,100,60,30, nine little-endian float32 at 0x18 = 100,-6,6,2000,-6,6,4000,-6,6."
+    },
+    "a2l1_blob_format": {
+      "endianness": "little-endian throughout",
+      "header": [
+        {
+          "offset": 0,
+          "type": "char[4]",
+          "value": "A2L1"
+        },
+        {
+          "offset": 4,
+          "type": "u16",
+          "name": "version",
+          "value": 1
+        },
+        {
+          "offset": 6,
+          "type": "u8",
+          "name": "weight_bits",
+          "value": 16
+        },
+        {
+          "offset": 7,
+          "type": "u8",
+          "name": "activation_bits",
+          "allowed": [
+            16,
+            32
+          ]
+        },
+        {
+          "offset": 8,
+          "type": "u32",
+          "name": "sample_rate",
+          "value": 48000
+        },
+        {
+          "offset": 12,
+          "type": "u16",
+          "name": "layer_count"
+        },
+        {
+          "offset": 14,
+          "type": "u8",
+          "name": "channels_C",
+          "range": "1..16"
+        },
+        {
+          "offset": 15,
+          "type": "u8",
+          "name": "head_kernel_K",
+          "range": "1..64"
+        },
+        {
+          "offset": 16,
+          "type": "i8",
+          "name": "Fin"
+        },
+        {
+          "offset": 17,
+          "type": "i8",
+          "name": "Fx3_0"
+        },
+        {
+          "offset": 18,
+          "type": "i8",
+          "name": "Fh"
+        },
+        {
+          "offset": 19,
+          "type": "i8",
+          "name": "Fout"
+        },
+        {
+          "offset": 20,
+          "type": "char[16]",
+          "name": "model_name",
+          "note": "UTF-8, truncated/zero padded to 16"
+        }
+      ],
+      "body_after_offset_36": [
+        "i8 rech_F ; i16[C] rech_W",
+        "for each layer: u8 K ; u16 dilation ; i8 Fz ; i8 Fx3 ; i32 lmul ; i8 cF ; i16[C*C*K] convW ; i64[C] convB ; i8 mF ; i16[C] mixW ; i8 lF ; i16[C*C] l1W ; i64[C] l1B",
+        "head: i8 hF ; i16[C*head_K] hW ; i64 hB",
+        "u32 CRC32 of every preceding byte"
+      ],
+      "total_size_formula": "36 + 1 + 2C + 4 + 1 + 2*C*headK + 8  +  sum over layers of (9 + 1 + 2*C*C*K + 8C + 1 + 2C + 1 + 2*C*C + 8C)",
+      "constraints_checked_by_converter": "|shift| <= 62 for every derived shift, conv shift 0..31 (otherwise firmware answers LOAD rc=-4)",
+      "scaling": "Weights int16 with per-tensor fractional bits (F*); activations int32 with per-stage fractional bits; biases int64 in accumulator format; layer slope stored as round(slope * 2^24) in lmul."
+    },
+    "a2l1_quantization": {
+      "purpose": "How the host derives every field of the A2L1 blob from a .nam file. Verified byte-for-byte against the reference browser converter on synthetic A2-Lite models (crates/pulsedeck-core/tests/reference.rs). Notation: F* = fractional bits; Q(v,F) = clamp(round_half_even(v * 2^F)); fbits(m,b) = b-1-(floor(log2 m)+1) (b-1 when m<=0).",
+      "source_model": [
+        "Accept architecture WaveNet, or SlimmableContainer (use the submodel with the smallest max_value = Lite).",
+        "Requirements: exactly 1 layer array, channels=3, all activations LeakyReLU, layer1x1 active (groups 1), head1x1 inactive, no gating / secondary_activation / FiLM / condition_dsp / global head, head kernel 1..64, layer kernel 1..15, dilation 1..65535, sample_rate 48000, weights count = C + sum(C*C*K + 4C + C*C) + C*headK + 1(head bias) + 1(trailing head_scale slot).",
+        "Weights are read as float32 (then widened to float64). Flat order: rechannel[C]; per layer: conv[C*C*K] (index (co*C+ci)*K+k), conv_bias[C], input_mixer[C], layer1x1[C*C], layer1x1_bias[C]; head[C*headK] (index ci*headK+k), head_bias. head_scale comes from config.head_scale (default 1)."
+      ],
+      "calibration": {
+        "method": "Float64 forward pass of the WaveNet over a calibration signal; record max|x| of: rechannel output (rech), z of each layer before activation = conv + bias + mixer (z[i]), residual x3 of each layer (x3[i]), head sum (head) and the final output including head_scale (out). Input is preceded by receptive_field-1 zeros.",
+        "receptive_field": "1 + sum((K_i-1)*dilation_i) + headK - 1",
+        "signal": "Built-in synthetic set measured segment by segment, maxima merged: 2 s log sweep 20 Hz..24 kHz (full scale), 2 s gaussian noise (sigma 0.5, clipped to +-1), three strummed guitar chords (E 2 s, A 1.5 s, D 1.5 s; Karplus-Strong, 12 ms string delay, peak 0.99, decay 0.9985). PRNG = mulberry32 seed 12345 + Box-Muller.",
+        "guard": "Measured maxima are multiplied by 1.5 (+3.5 dB) when the built-in signal is used."
+      },
+      "format_selection": {
+        "weights_bits": 16,
+        "activation_bits": 32,
+        "Fin": "fbits(1.0, 32)",
+        "Fx3_0": "fbits(rech*2, 32)",
+        "Fh": "min(fbits(head*2, 32), min_i(Fz_i) - 1)   (keeps the head-sum shift Fz-Fh >= 1 in every layer)",
+        "Fout": "fbits(out*2, 32)",
+        "Fz_i": "fbits(z_i*2, 32)",
+        "Fx3_i": "fbits(x3_i*2, 32)"
+      },
+      "weight_quantisation": {
+        "rule": "Each tensor T gets F = min(fbits(max|T|, 16), Fcap); weights = Q(T, F) as int16.",
+        "Fcap": {
+          "rechannel": "Fx3_0 - Fin + 31",
+          "conv_i": "Fz_i - Fx3_(i-1) + 31   (Fx3_(-1) = Fx3_0)",
+          "mixer_i": "Fz_i - Fin + 31",
+          "layer1x1_i": "Fx3_i - Fz_i + 31",
+          "head": "Fout - Fh + 31   (applied to head * head_scale; head_scale is folded into the head weights and bias)"
+        },
+        "biases": {
+          "conv_bias_i": "Q64(b, cF_i + Fx3_(i-1))",
+          "layer1x1_bias_i": "Q64(b, lF_i + Fz_i)",
+          "head_bias": "Q64(head_bias*head_scale, hF + Fh)",
+          "note": "int64, saturating."
+        },
+        "lmul": "round(negative_slope * 2^24) as int32 (default slope 0.01)",
+        "model_name": "metadata.name (or 'NAM'), UTF-8, truncated to 16 bytes at a character boundary"
+      },
+      "validation": [
+        "All F values must fit int8.",
+        "|shift| <= 62 for: rF+Fin-Fx3_0; per layer cF+Fx3_(i-1)-Fz, mF+Fin-Fz, lF+Fz-Fx3, Fx3_(i-1)-Fx3, Fz-Fh.",
+        "Conv shift cF+Fx3_(i-1)-Fz in 0..31 for every layer; output shift hF+Fh-Fout in 0..31.",
+        "A blob failing these would be answered with LOAD rc=-4, so the host refuses to send it."
+      ],
+      "metadata_used_by_host": {
+        "gear_type": "metadata.gear_type classifies the capture for the UI. FULL_RIG: contains the cab (tokens cab / studio / rig / full, e.g. amp_cab, amp_pedal_cab, studio). AMP_ONLY: amp / preamp / head without cab (amp, preamp, pedal_amp). Anything else (pedal, missing) is 'other'.",
+        "input_level": "metadata.input_level_dbu (fallback metadata.input_level); when in -20..40 dBu the host sends 'CTRIM live 0 <round(dBu*10)>' before CSAVE."
+      }
+    },
+    "impulse_response_wav": {
+      "source_file": ".wav (any rate/channels the browser can decode; first channel used; resampled to 48 kHz by the browser)",
+      "host_preparation": [
+        "Take the first N samples: N = 4076 for IR slots 0..6 and for an unslotted upload, 2028 for slot 7 (IRBEGIN accepts <= 4096).",
+        "Apply a raised-cosine fade-out over the last min(N/8, 256) samples.",
+        "Normalise to unit energy (divide by sqrt(sum x^2)); reject all-zero files.",
+        "Scale by the peak to full-scale int16: q[i] = round(x[i]/peak*32767).",
+        "Strip trailing zero samples.",
+        "gain_mdB = round(20000*log10(peak*32768/32767))  (integer milli-dB the pedal re-applies).",
+        "If the pedal answers an out-of-memory error, retry with N = 2048, then 1024."
+      ],
+      "payload_encoding": "signed int16 little-endian, mono, 48 kHz, 2 bytes per sample (byte stream = the Int16Array memory)",
+      "steps": [
+        {
+          "cmd": "IRBEGIN <sample_count> <gain_mdB> 48",
+          "reply": "OK IRBEGIN <sample_count>",
+          "errors": [
+            "ERR IRBEGIN 1..4096"
+          ],
+          "note": "Third argument is sample rate in kHz (24 or 48 accepted). 'IRBEGIN 0 0 48' releases the buffer."
+        },
+        {
+          "cmd": "IRB <byte_offset> <hex>",
+          "reply": "OK IRB <offset> <len>",
+          "note": "offset counts bytes, not samples."
+        },
+        {
+          "cmd": "IREND <crc32_hex8>",
+          "reply": "IR ok <samples> samples gain <mdB> mdB fs <kHz>",
+          "timeout_ms": 5000,
+          "note": "This loads it as the sounding (shared) IR."
+        },
+        {
+          "cmd": "ISAVE <slot 0..7> <name up to 23 chars>",
+          "reply": "ISAVE ok <slot> '<name>' <samples> samples fs=<kHz>",
+          "timeout_ms": 8000,
+          "optional": true
+        },
+        {
+          "cmd": "FXIR <block_id> <slot>",
+          "optional": true,
+          "note": "Assign a stored IR to a specific 'ir' block."
+        }
+      ]
+    },
+    "audio_mode": {
+      "AUDIO OFF": "mute DSP",
+      "AUDIO A2L": "start capture engine",
+      "reply": "AUDIO <mode>  (2 = running)",
+      "timeouts_ms": {
+        "OFF": 5000,
+        "A2L": 12000
+      }
+    }
+  },
+  "effects": {
+    "runtime_discovery": "Authoritative list = reply of FXT (see commands.handshake_and_state_read.FXT); ids and ranges can change with firmware. This table is the reference catalog shipped in the control page (covers ids 1..39).",
+    "retired_ids": {
+      "6": "reverb (read as reverb2)",
+      "24": "pitch (read as pitchpro)"
+    },
+    "not_an_fx_type": "The amp/capture block is controlled with AMP/AMPX/AMPEQ and is absent from this table.",
+    "per_block_limits": {
+      "max_parameters": 7
+    },
+    "categories": [
+      "dynamics",
+      "drive",
+      "dist",
+      "amp",
+      "cab",
+      "eq",
+      "mod",
+      "delay",
+      "reverb"
+    ],
+    "category_note": "Category is the pedal-side 'cat='. The editor additionally groups pitchpro and doubler as a 'pitch' family (field editor_family).",
+    "parameter_name_suffix_units": {
+      "_db": "dB",
+      "_hz": "Hz",
+      "_ms": "ms",
+      "_pct": "percent 0..100 unless range says otherwise",
+      "_chz": "centi-Hz (value/100 = Hz)",
+      "_x10": "ratio x10 (40 = 4.0:1)",
+      "_st": "semitones",
+      "_ct": "cents",
+      "_n": "count / mode index"
+    },
+    "parameter_encodings": {
+      "sync": {
+        "values": [
+          "free",
+          "1/4",
+          "1/8 dotted",
+          "1/8",
+          "1/8 triplet",
+          "1/16",
+          "1/2",
+          "1/4 dotted",
+          "1/4 triplet",
+          "1/16 triplet",
+          "1 bar",
+          "2 bars",
+          "4 bars"
+        ],
+        "note": "index = value; 0 = use free time/rate parameter. Delay accepts 0..9, LFO effects 0..12."
+      },
+      "os_n": {
+        "0": "off",
+        "1": "2x",
+        "2": "4x (legacy)",
+        "3": "2x + anti-aliasing (ADAA)",
+        "note": "FXT 'os tiers' line gives the values for off/normal/high."
+      },
+      "lowcut_hz": "0 = off, otherwise Hz",
+      "ir.largo_ms": "0 = full length, 1..85 ms",
+      "ir.ir_slot": "0 = shared preset IR, n = stored IR slot n-1",
+      "pitchpro.modo": {
+        "0": "normal",
+        "2": "high (vocoder); 1 retired, read as 2"
+      },
+      "shimmer.intervalo": {
+        "0": "+12 st",
+        "1": "+7 st",
+        "2": "+19 st",
+        "3": "-12 st"
+      },
+      "fuzzface.modelo": {
+        "0": "Fuzz Face",
+        "1": "Tone Bender"
+      },
+      "basseq.geb7": "0 = Heart-Rock voicing, 1 = GEB-7 voicing (range allows up to 1023, only 0/1 used)",
+      "envfilter.filtro_modo": {
+        "0..5": "type*2 + direction: types LP,BP,HP (0-1 LP, 2-3 BP, 4-5 HP) with up/down sweep (exact order unverified)",
+        "6,7": "Wah"
+      },
+      "rotary.velocidad": {
+        "0": "slow",
+        "1": "fast",
+        "2": "brake"
+      },
+      "rotary.inercia_pct": "low 7 bits (0..127) = inertia percent; value>>7 = slow-rate in tenths of Hz (0 = default 0.8 Hz)",
+      "cloud.freeze": "0 / 1",
+      "stereo_firmware_extra_parameters": "Firmware built with stereo support may add parameters 'estereo' (0 mono /1 stereo; chorus, vibrato, delay use inverted 'mono' instead), 'ancho_pct' (width), 'modo_st' (doubler: 1 standard, 2 triple). They appear only in that firmware's FXT reply."
+    },
+    "table": [
+      {
+        "id": 1,
+        "name": "gate",
+        "category": "dynamics",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "umbral_db",
+            "min": -90,
+            "max": 0,
+            "default": -70
+          },
+          {
+            "index": 1,
+            "name": "release_ms",
+            "min": 5,
+            "max": 1000,
+            "default": 120
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "name": "boost",
+        "category": "drive",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "ganancia_db",
+            "min": -12,
+            "max": 24,
+            "default": 6
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "name": "overdrive",
+        "category": "drive",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "drive_db",
+            "min": 0,
+            "max": 40,
+            "default": 18
+          },
+          {
+            "index": 1,
+            "name": "tono_hz",
+            "min": 1000,
+            "max": 9000,
+            "default": 4000
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 0,
+            "default": -8
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "name": "eq",
+        "category": "eq",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "graves_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 1,
+            "name": "medios_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 2,
+            "name": "medios_hz",
+            "min": 200,
+            "max": 5000,
+            "default": 800
+          },
+          {
+            "index": 3,
+            "name": "agudos_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "name": "delay",
+        "category": "delay",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tiempo_ms",
+            "min": 10,
+            "max": 2000,
+            "default": 350
+          },
+          {
+            "index": 1,
+            "name": "realim_pct",
+            "min": 0,
+            "max": 95,
+            "default": 35
+          },
+          {
+            "index": 2,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 3,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 90,
+            "default": 30
+          },
+          {
+            "index": 4,
+            "name": "sync",
+            "min": 0,
+            "max": 9,
+            "default": 0
+          },
+          {
+            "index": 5,
+            "name": "lowcut_hz",
+            "min": 0,
+            "max": 800,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "name": "ir",
+        "category": "cab",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 100
+          },
+          {
+            "index": 1,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 2,
+            "name": "ir_slot",
+            "min": 0,
+            "max": 8,
+            "default": 0
+          },
+          {
+            "index": 3,
+            "name": "largo_ms",
+            "min": 0,
+            "max": 85,
+            "default": 21
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "name": "comp",
+        "category": "dynamics",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "umbral_db",
+            "min": -50,
+            "max": 0,
+            "default": -24
+          },
+          {
+            "index": 1,
+            "name": "ratio_x10",
+            "min": 10,
+            "max": 200,
+            "default": 40
+          },
+          {
+            "index": 2,
+            "name": "ataque_ms",
+            "min": 1,
+            "max": 100,
+            "default": 8
+          },
+          {
+            "index": 3,
+            "name": "release_ms",
+            "min": 20,
+            "max": 1000,
+            "default": 150
+          },
+          {
+            "index": 4,
+            "name": "nivel_db",
+            "min": -12,
+            "max": 24,
+            "default": 6
+          },
+          {
+            "index": 5,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 100
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "name": "ts9",
+        "category": "drive",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "drive_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -6
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "name": "ds1",
+        "category": "dist",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "dist_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -10
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "name": "chorus",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "vel_chz",
+            "min": 5,
+            "max": 500,
+            "default": 80
+          },
+          {
+            "index": 1,
+            "name": "prof_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "sync",
+            "min": 0,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "lowcut_hz",
+            "min": 0,
+            "max": 800,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "name": "flanger",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "vel_chz",
+            "min": 5,
+            "max": 300,
+            "default": 25
+          },
+          {
+            "index": 1,
+            "name": "prof_pct",
+            "min": 0,
+            "max": 100,
+            "default": 70
+          },
+          {
+            "index": 2,
+            "name": "realim_pct",
+            "min": -90,
+            "max": 90,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "sync",
+            "min": 0,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 5,
+            "name": "lowcut_hz",
+            "min": 0,
+            "max": 800,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 13,
+        "name": "phaser",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "vel_chz",
+            "min": 5,
+            "max": 500,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "prof_pct",
+            "min": 0,
+            "max": 100,
+            "default": 80
+          },
+          {
+            "index": 2,
+            "name": "realim_pct",
+            "min": 0,
+            "max": 90,
+            "default": 40
+          },
+          {
+            "index": 3,
+            "name": "sync",
+            "min": 0,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "lowcut_hz",
+            "min": 0,
+            "max": 800,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 14,
+        "name": "tremolo",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "vel_chz",
+            "min": 50,
+            "max": 1500,
+            "default": 500
+          },
+          {
+            "index": 1,
+            "name": "prof_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 2,
+            "name": "forma_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          },
+          {
+            "index": 3,
+            "name": "sync",
+            "min": 0,
+            "max": 12,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 15,
+        "name": "vibrato",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "vel_chz",
+            "min": 50,
+            "max": 1000,
+            "default": 500
+          },
+          {
+            "index": 1,
+            "name": "prof_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 2,
+            "name": "sync",
+            "min": 0,
+            "max": 12,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 16,
+        "name": "klon",
+        "category": "drive",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "ganancia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 1,
+            "name": "agudos_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -6
+          },
+          {
+            "index": 3,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          }
+        ]
+      },
+      {
+        "id": 17,
+        "name": "rat",
+        "category": "dist",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "dist_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "filtro_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -10
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 18,
+        "name": "muff",
+        "category": "dist",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "sustain_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -10
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 3
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 19,
+        "name": "fuzzface",
+        "category": "dist",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "fuzz_pct",
+            "min": 0,
+            "max": 100,
+            "default": 70
+          },
+          {
+            "index": 1,
+            "name": "bias_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 3,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -10
+          },
+          {
+            "index": 4,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 3
+          },
+          {
+            "index": 5,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "modelo",
+            "min": 0,
+            "max": 1,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 20,
+        "name": "bd2",
+        "category": "drive",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "drive_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -8
+          },
+          {
+            "index": 3,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          },
+          {
+            "index": 4,
+            "name": "limpio_pct",
+            "min": 0,
+            "max": 100,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 21,
+        "name": "amp_clean",
+        "category": "amp",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "ganancia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 1,
+            "name": "graves_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "medios_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "agudos_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "presencia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -6
+          },
+          {
+            "index": 6,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          }
+        ]
+      },
+      {
+        "id": 22,
+        "name": "amp_brit",
+        "category": "amp",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "ganancia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "graves_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "medios_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 3,
+            "name": "agudos_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          },
+          {
+            "index": 4,
+            "name": "presencia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -6
+          },
+          {
+            "index": 6,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 1
+          }
+        ]
+      },
+      {
+        "id": 23,
+        "name": "amp_hi",
+        "category": "amp",
+        "oversampling_tier_values": {
+          "off": 0,
+          "normal": 1,
+          "high": 3
+        },
+        "parameters": [
+          {
+            "index": 0,
+            "name": "ganancia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 1,
+            "name": "graves_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          },
+          {
+            "index": 2,
+            "name": "medios_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 3,
+            "name": "agudos_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 4,
+            "name": "presencia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 6,
+            "default": -8
+          },
+          {
+            "index": 6,
+            "name": "os_n",
+            "min": 0,
+            "max": 3,
+            "default": 3
+          }
+        ]
+      },
+      {
+        "id": 25,
+        "name": "doubler",
+        "category": "mod",
+        "editor_family": "pitch",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "retardo_ms",
+            "min": 5,
+            "max": 40,
+            "default": 20
+          },
+          {
+            "index": 1,
+            "name": "detune_ct",
+            "min": -20,
+            "max": 20,
+            "default": 7
+          },
+          {
+            "index": 2,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 12,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 26,
+        "name": "hum",
+        "category": "eq",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "mains_hz",
+            "min": 50,
+            "max": 60,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "depth_att",
+            "min": 3,
+            "max": 40,
+            "default": 24
+          },
+          {
+            "index": 2,
+            "name": "ancho_hz",
+            "min": 1,
+            "max": 20,
+            "default": 4
+          },
+          {
+            "index": 3,
+            "name": "armonicos_n",
+            "min": 1,
+            "max": 4,
+            "default": 2
+          }
+        ]
+      },
+      {
+        "id": 27,
+        "name": "reverb2",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tamano_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 2,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 3,
+            "name": "predelay_ms",
+            "min": 0,
+            "max": 100,
+            "default": 15
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "mod_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          }
+        ]
+      },
+      {
+        "id": 28,
+        "name": "sgate",
+        "category": "dynamics",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "umbral_db",
+            "min": -90,
+            "max": -20,
+            "default": -52
+          },
+          {
+            "index": 1,
+            "name": "rango_att",
+            "min": 6,
+            "max": 90,
+            "default": 60
+          },
+          {
+            "index": 2,
+            "name": "release_ms",
+            "min": 20,
+            "max": 1000,
+            "default": 200
+          },
+          {
+            "index": 3,
+            "name": "hush_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          }
+        ]
+      },
+      {
+        "id": 29,
+        "name": "pitchpro",
+        "category": "mod",
+        "editor_family": "pitch",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "semitonos_st",
+            "min": -12,
+            "max": 12,
+            "default": 12
+          },
+          {
+            "index": 1,
+            "name": "cents_ct",
+            "min": -50,
+            "max": 50,
+            "default": 0
+          },
+          {
+            "index": 2,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "nivel_db",
+            "min": -30,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "ventana_ms",
+            "min": 10,
+            "max": 27,
+            "default": 25
+          },
+          {
+            "index": 5,
+            "name": "ataque_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 6,
+            "name": "modo",
+            "min": 0,
+            "max": 2,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 30,
+        "name": "spectral",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          },
+          {
+            "index": 1,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 2,
+            "name": "difus_pct",
+            "min": 0,
+            "max": 100,
+            "default": 70
+          },
+          {
+            "index": 3,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 35
+          },
+          {
+            "index": 4,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 31,
+        "name": "shimmer",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tamano_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 70
+          },
+          {
+            "index": 2,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 45
+          },
+          {
+            "index": 3,
+            "name": "intervalo",
+            "min": 0,
+            "max": 3,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 34
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "shimmer_pct",
+            "min": 0,
+            "max": 100,
+            "default": 22
+          }
+        ]
+      },
+      {
+        "id": 32,
+        "name": "hybrid",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tamano_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 45
+          },
+          {
+            "index": 2,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 3,
+            "name": "predelay_ms",
+            "min": 0,
+            "max": 100,
+            "default": 12
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "er_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          }
+        ]
+      },
+      {
+        "id": 33,
+        "name": "plate",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tamano_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 55
+          },
+          {
+            "index": 2,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 25
+          },
+          {
+            "index": 3,
+            "name": "predelay_ms",
+            "min": 0,
+            "max": 100,
+            "default": 10
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "mod_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          }
+        ]
+      },
+      {
+        "id": 34,
+        "name": "spring",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "dwell_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 45
+          },
+          {
+            "index": 2,
+            "name": "tono_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 3,
+            "name": "resortes_n",
+            "min": 1,
+            "max": 3,
+            "default": 2
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 30
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "drip_pct",
+            "min": 0,
+            "max": 100,
+            "default": 60
+          }
+        ]
+      },
+      {
+        "id": 35,
+        "name": "cloud",
+        "category": "reverb",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "tamano_pct",
+            "min": 0,
+            "max": 100,
+            "default": 70
+          },
+          {
+            "index": 1,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 65
+          },
+          {
+            "index": 2,
+            "name": "amort_pct",
+            "min": 0,
+            "max": 100,
+            "default": 35
+          },
+          {
+            "index": 3,
+            "name": "mod_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -24,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "freeze",
+            "min": 0,
+            "max": 1,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 36,
+        "name": "geq",
+        "category": "eq",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "g50_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 1,
+            "name": "g125_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 2,
+            "name": "g315_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 3,
+            "name": "g800_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "g2k_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 5,
+            "name": "g5k_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "nivel_db",
+            "min": -12,
+            "max": 12,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 37,
+        "name": "basseq",
+        "category": "eq",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "graves_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 1,
+            "name": "bajos_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 2,
+            "name": "medios_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 3,
+            "name": "altos_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 4,
+            "name": "agudos_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 5,
+            "name": "nivel_db",
+            "min": -15,
+            "max": 15,
+            "default": 0
+          },
+          {
+            "index": 6,
+            "name": "geb7",
+            "min": 0,
+            "max": 1023,
+            "default": 0
+          }
+        ]
+      },
+      {
+        "id": 38,
+        "name": "envfilter",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "sens_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 1,
+            "name": "frec_lo_hz",
+            "min": 40,
+            "max": 1000,
+            "default": 300
+          },
+          {
+            "index": 2,
+            "name": "frec_hi_hz",
+            "min": 200,
+            "max": 8000,
+            "default": 2400
+          },
+          {
+            "index": 3,
+            "name": "reso_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "decay_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 5,
+            "name": "filtro_modo",
+            "min": 0,
+            "max": 7,
+            "default": 1
+          },
+          {
+            "index": 6,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 100
+          }
+        ]
+      },
+      {
+        "id": 39,
+        "name": "rotary",
+        "category": "mod",
+        "parameters": [
+          {
+            "index": 0,
+            "name": "velocidad",
+            "min": 0,
+            "max": 2,
+            "default": 0
+          },
+          {
+            "index": 1,
+            "name": "drive_pct",
+            "min": 0,
+            "max": 100,
+            "default": 20
+          },
+          {
+            "index": 2,
+            "name": "rapido_chz",
+            "min": 300,
+            "max": 1000,
+            "default": 667
+          },
+          {
+            "index": 3,
+            "name": "inercia_pct",
+            "min": 0,
+            "max": 2660,
+            "default": 50
+          },
+          {
+            "index": 4,
+            "name": "bocina_pct",
+            "min": 0,
+            "max": 100,
+            "default": 50
+          },
+          {
+            "index": 5,
+            "name": "distancia_pct",
+            "min": 0,
+            "max": 100,
+            "default": 40
+          },
+          {
+            "index": 6,
+            "name": "mezcla_pct",
+            "min": 0,
+            "max": 100,
+            "default": 100
+          }
+        ]
+      }
+    ]
+  }
+}
