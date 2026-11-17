@@ -73,7 +73,7 @@ const transportListeners = new Set<(t: TransportState) => void>();
 const pushTransport = () => transportListeners.forEach((f) => f({ ...transport }));
 const fakeDevices: BleDevice[] = [
   { id: "AA:01", name: "Tank-G 4F2A", rssi: -48, services: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"], matches: true },
-  { id: "AA:02", name: "UltraRig-91C0", rssi: -77, services: [], matches: true },
+  { id: "AA:02", name: "Tank-G-91C0", rssi: -77, services: [], matches: true },
   { id: "AA:03", name: "Galaxy Buds", rssi: -60, services: [], matches: false },
 ];
 

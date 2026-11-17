@@ -965,7 +965,7 @@ impl Connector for SimConnector {
                 name: "SIM0".into(),
                 vid: self.vid,
                 pid: 1,
-                product: Some("UltraRig (simulated)".into()),
+                product: Some("Tank-G (simulated)".into()),
                 serial_number: None,
             }]
         } else {

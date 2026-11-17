@@ -328,7 +328,7 @@ export const pt = {
   "add.search": "Buscar efeito…",
   "add.none": "Nenhum efeito.",
   "app.starting": "Iniciando…",
-  "app.not_ultrarig": "A porta respondeu, mas não é um UltraRig",
+  "app.not_supported": "A porta respondeu, mas não é uma pedaleira compatível",
   "app.connect_usb": "Conecte a pedaleira via USB",
   "app.connect_hint": "O PulseDeck procura automaticamente uma porta com VID 0x3654 e valida com PING → PONG. Se você desconectar ou reiniciar a pedaleira, ele reconecta sozinho.",
   "app.connect_ble": "Escolha a pedaleira por Bluetooth",

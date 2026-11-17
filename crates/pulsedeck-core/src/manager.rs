@@ -83,7 +83,7 @@ pub fn handshake(
         }
     }
     session.close();
-    Err("no PONG: not an UltraRig firmware or wrong port".into())
+    Err("no PONG: not a supported firmware or wrong port".into())
 }
 
 impl Manager {

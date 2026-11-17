@@ -1,5 +1,47 @@
+# ---- build output ----
 target/
 node_modules/
 dist/
 src-tauri/gen/
+build/
+.pio/
+*.o
+*.obj
+*.a
+*.elf
+*.map
+*.pyc
+__pycache__/
+
+# ---- firmware images and dumps: NEVER publish ----
+# Images built by tools/pack.py are packed into a container taken from YOUR pedal's own
+# app area (they carry its boot header/config); flash read-backs carry unit-unique data
+# (Bluetooth keys, OTP, calibration). Factory images belong to their vendor.
+*.bin
+*.uf2
+*.ota
+*.fwsc
+*.ufw
+*.hex
+*.sha256
+*.am2
+*.am3
+*.am4
+backup_tankg/
+**/flash_run_*/
+
+# ---- local-only config, logs, scratch ----
 *.log
+*.bak
+*.orig
+*.allon_bad
+*.swp
+.DS_Store
+.vscode/
+.idea/
+local.env
+firmware-tankg/tools/local.env
+# your own captures / IRs used for testing
+*.wav
+/*.nam
+/*.a2l

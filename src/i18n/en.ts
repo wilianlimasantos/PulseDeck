@@ -330,7 +330,7 @@ export const en: Record<Key, string> = {
   "add.search": "Search effect…",
   "add.none": "No effects.",
   "app.starting": "Starting…",
-  "app.not_ultrarig": "The port answered, but it is not an UltraRig",
+  "app.not_supported": "The port answered, but it is not a supported pedal",
   "app.connect_usb": "Connect the pedal via USB",
   "app.connect_hint": "PulseDeck automatically looks for a port with VID 0x3654 and validates it with PING → PONG. If you unplug or restart the pedal, it reconnects on its own.",
   "app.connect_ble": "Pick the pedal over Bluetooth",

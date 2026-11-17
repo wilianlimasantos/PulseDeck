@@ -9,6 +9,7 @@ const RULES: Array<[RegExp, string]> = [
   [/^Preparando$/, "Preparing"],
   [/^Carregando no motor$/, "Loading into the engine"],
   [/^Convertendo \.nam → A2L1$/, "Converting .nam → A2L1"],
+  [/^Compactando captura para a pedaleira \(erro (.+) %\)$/, "Compacting the capture for the pedal (error $1 %)"],
   [/^Reamostrando WAV → 48 kHz$/, "Resampling WAV → 48 kHz"],
   [/^Concluído$/, "Done"],
   [/^Backup salvo$/, "Backup saved"],

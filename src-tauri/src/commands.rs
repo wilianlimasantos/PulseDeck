@@ -3,7 +3,7 @@
 
 use crate::files::{self, Listing};
 use crate::state::{Shared, Snapshot};
-use pulsedeck_core::a2l::{convert_file, ConvertOptions};
+use pulsedeck_core::a2l::{convert_file, Budget, ConvertOptions, DistillProgress};
 use pulsedeck_core::backup::{self, RestoreReport};
 use pulsedeck_core::ir::{read_wav_first_channel, resample, TARGET_RATE};
 use pulsedeck_core::nam::GearClass;
@@ -352,8 +352,23 @@ pub async fn upload_file(
                             total: 1,
                         },
                     );
-                    let (out, info) =
-                        convert_file(&p, &ConvertOptions::default()).map_err(|e| e.to_string())?;
+                    // The open Tank-G firmware says what its capture player can take (CAPS); a heavier capture is compacted into a
+                    // smaller network first. Stock firmware does not know CAPS: the capture is converted as it is.
+                    let budget = session.send("CAPS", None).ok().and_then(|r| Budget::from_caps(r.terminal()));
+                    let app2 = app.clone();
+                    let opts = ConvertOptions {
+                        budget,
+                        progress: Some(DistillProgress(Arc::new(move |step, total, err| {
+                            if step % 100 == 0 || step == total {
+                                let _ = app2.emit(
+                                    "pedal:progress",
+                                    Progress { stage: format!("Compactando captura para a pedaleira (erro {:.1} %)", err * 100.0), done: step, total },
+                                );
+                            }
+                        }))),
+                        ..Default::default()
+                    };
+                    let (out, info) = convert_file(&p, &opts).map_err(|e| e.to_string())?;
                     let name = info.name.clone().filter(|n| !n.is_empty()).unwrap_or(stem);
                     (out.blob, name, Some(info.class), info.input_level_dbu)
                 } else {
@@ -386,7 +401,8 @@ pub async fn upload_file(
                 }
             }
             "wav" => {
-                let used: Vec<u8> = snap.irs.entries.iter().map(|e| e.slot).collect();
+                // size 0 = a built-in cabinet of the open Tank-G firmware: the slot is free for an upload
+                let used: Vec<u8> = snap.irs.entries.iter().filter(|e| e.bytes > 0).map(|e| e.slot).collect();
                 let slot = match slot {
                     Some(s) => s,
                     None => first_free(&used, core.protocol.ir_slots).ok_or(

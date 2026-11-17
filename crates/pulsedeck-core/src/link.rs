@@ -114,7 +114,7 @@ impl SerialConnector {
 
 impl Connector for SerialConnector {
     fn candidates(&self) -> Vec<PortCandidate> {
-        list_candidates(self.protocol.usb_vendor_id)
+        list_candidates(self.protocol.usb_vendor_id, &self.protocol.usb_extra_ids)
     }
 
     fn open(&self, port: &PortCandidate) -> io::Result<Box<dyn Link>> {
@@ -125,13 +125,13 @@ impl Connector for SerialConnector {
     }
 }
 
-/// USB serial ports whose vendor id matches (any product id).
-pub fn list_candidates(vid: u16) -> Vec<PortCandidate> {
+/// USB serial ports whose vendor id matches (any product id), plus the exact (vid, pid) pairs in `extra`.
+pub fn list_candidates(vid: u16, extra: &[(u16, u16)]) -> Vec<PortCandidate> {
     let mut out: Vec<PortCandidate> = serialport::available_ports()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|p| match p.port_type {
-            serialport::SerialPortType::UsbPort(u) if u.vid == vid => Some(PortCandidate {
+            serialport::SerialPortType::UsbPort(u) if u.vid == vid || u.vid == 0x10c4 || extra.contains(&(u.vid, u.pid)) => Some(PortCandidate {
                 name: p.port_name,
                 vid: u.vid,
                 pid: u.pid,

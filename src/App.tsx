@@ -43,7 +43,7 @@ function Disconnected() {
     <div className="flex h-full flex-col items-center justify-center gap-3 text-center text-ink-300">
       <svg width="64" height="64" viewBox="0 0 26 26" aria-hidden><path d="M2 14h5l3-8 4 14 3-6h6" fill="none" stroke="var(--color-ink-500)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
       <div className="text-[15px] font-medium text-ink-100">
-        {st.state === "not_responding" ? t("app.not_ultrarig") : ble ? t("app.connect_ble") : t("app.connect_usb")}
+        {st.state === "not_responding" ? t("app.not_supported") : ble ? t("app.connect_ble") : t("app.connect_usb")}
       </div>
       <div className="max-w-sm text-[12px]">
         {st.state === "not_responding"

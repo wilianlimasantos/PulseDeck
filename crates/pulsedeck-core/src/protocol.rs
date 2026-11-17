@@ -56,6 +56,8 @@ pub struct BleConfig {
 pub struct Protocol {
     raw: Value,
     pub usb_vendor_id: u16,
+    /// Additional (vid, pid) pairs accepted as a pedal (the open Tank-G firmware uses 0x1209:0x0001).
+    pub usb_extra_ids: Vec<(u16, u16)>,
     pub baud_rate: u32,
     pub default_timeout: Duration,
     /// (first firmware number where the limit applies, max line chars) sorted ascending.
@@ -103,6 +105,14 @@ impl Protocol {
             .as_str()
             .and_then(parse_hex_u16)
             .ok_or("transport.usb_vendor_id missing")?;
+        let usb_extra_ids: Vec<(u16, u16)> = transport["usb_extra_ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| Some((parse_hex_u16(e["vid"].as_str()?)?, parse_hex_u16(e["pid"].as_str()?)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let baud_rate = transport["serial_settings"]["baud_rate"]
             .as_u64()
             .ok_or("transport.serial_settings.baud_rate missing")? as u32;
@@ -152,6 +162,7 @@ impl Protocol {
 
         Ok(Self {
             usb_vendor_id,
+            usb_extra_ids,
             baud_rate,
             default_timeout: Duration::from_millis(default_timeout_ms),
             line_limits,
@@ -350,6 +361,7 @@ mod tests {
     fn reads_transport_from_json() {
         let p = Protocol::embedded();
         assert_eq!(p.usb_vendor_id, 0x3654);
+        assert!(p.usb_extra_ids.contains(&(0x1209, 0x0001)), "open Tank-G firmware id must be accepted");
         assert_eq!(p.baud_rate, 115200);
         assert_eq!(p.default_timeout, Duration::from_millis(1500));
         assert_eq!(p.ping_attempts, 5);

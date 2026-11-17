@@ -5,3 +5,7 @@ members = ["crates/pulsedeck-core", "src-tauri"]
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The capture compaction (a2l/distill.rs) trains a small network: unoptimised it would take half an hour instead of a minute or two.
+[profile.dev.package.pulsedeck-core]
+opt-level = 3

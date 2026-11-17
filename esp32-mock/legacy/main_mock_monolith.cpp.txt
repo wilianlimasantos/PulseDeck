@@ -1,0 +1,685 @@
+#include <Arduino.h>
+#include <vector>
+#include <map>
+
+struct Block {
+  uint32_t id;
+  char bank;
+  String type_name;
+  bool on;
+  std::vector<int32_t> params;
+  uint8_t lane;
+};
+
+struct StoredPreset {
+  bool used;
+  String name;
+  String color;
+  std::vector<Block> blocks;
+  bool amp_present = true;
+  bool amp_on = true;
+  int32_t ampeq[6] = {0, 0, 0, 0, 0, 0};
+  int32_t gain_in = 0;
+  int32_t gain_out = 0;
+  int32_t capture = 0;
+  String scene_names[4] = {"Scene 1", "Scene 2", "Scene 3", "Scene 4"};
+};
+
+std::vector<Block> blocks;
+StoredPreset stored[32];
+uint32_t next_id = 1;
+uint32_t generation = 1;
+int32_t current_preset = 0;
+int32_t current_scene = 0;
+bool amp_present = true;
+bool amp_on = true;
+int32_t ampeq[6] = {0, 0, 0, 0, 0, 0};
+int32_t gain_in = 0, gain_out = 0;
+int32_t capture_cur = 0;
+String preset_color = "";
+int32_t hpf = 80;
+int32_t geq[6] = {0, 0, 0, 0, 0, 0};
+int32_t audio_mode = 2;
+int64_t cpu_budget = 1000;
+
+bool tuner_on = false;
+bool tuner_mute = false;
+uint32_t tuner_ref = 440;
+uint32_t tune_tick = 0;
+
+String fsmode = "factory";
+std::map<String, String> ledcfg;
+std::map<String, String> fsa;
+
+struct FsLed {
+  bool custom;
+  String on_col;
+  String off_col;
+};
+FsLed fsled[4] = {
+  {false, "28beff", "000000"},
+  {false, "28ff5a", "000000"},
+  {false, "ffaa1e", "000000"},
+  {false, "e63cff", "000000"}
+};
+
+struct SlotMeta {
+  bool used;
+  String name;
+  size_t size;
+};
+SlotMeta captures[15];
+SlotMeta irs[8];
+
+bool staging = false;
+char stage_kind = 'C';
+size_t stage_expected = 0;
+size_t stage_received = 0;
+uint32_t stage_crc = 0xFFFFFFFF;
+size_t last_blob_size = 0;
+size_t last_ir_size = 0;
+
+uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
+for (size_t i = 0; i < len; i++) {
+crc ^= data[i];
+for (int k = 0; k < 8; k++) {
+crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+}
+}
+return crc;
+}
+
+std::vector<int32_t> defaultParamsFor(const String& name) {
+if (name == "gate") return {50, 50};
+if (name == "comp") return {50, 50, 50};
+if (name == "boost") return {50, 50};
+if (name == "overdrive" || name == "distortion") return {50, 50, 50};
+if (name == "chorus" || name == "flanger" || name == "phaser" || name == "tremolo") return {40, 50, 50};
+if (name == "delay") return {35, 40, 30, 50};
+if (name == "reverb" || name == "reverb2") return {35, 50, 50};
+if (name == "ir") return {0, 50, 100, 0};
+return {50, 50};
+}
+
+int64_t calcCost() {
+int64_t fx = 0;
+for (const auto& b : blocks) {
+if (b.on) fx += 40 + 5 * (int64_t)b.params.size();
+}
+return fx + ((amp_on && amp_present) ? 380 : 0);
+}
+
+void storeCurrent(uint8_t slot, const String& name) {
+if (slot >= 32) return;
+stored[slot].used = true;
+stored[slot].name = name;
+stored[slot].color = preset_color;
+stored[slot].blocks = blocks;
+stored[slot].amp_present = amp_present;
+stored[slot].amp_on = amp_on;
+memcpy(stored[slot].ampeq, ampeq, sizeof(ampeq));
+stored[slot].gain_in = gain_in;
+stored[slot].gain_out = gain_out;
+stored[slot].capture = capture_cur;
+current_preset = slot;
+}
+
+bool applyStored(uint8_t slot) {
+if (slot >= 32 || !stored[slot].used) return false;
+blocks.clear();
+for (auto b : stored[slot].blocks) {
+b.id = next_id++;
+blocks.push_back(b);
+}
+amp_present = stored[slot].amp_present;
+amp_on = stored[slot].amp_on;
+memcpy(ampeq, stored[slot].ampeq, sizeof(ampeq));
+gain_in = stored[slot].gain_in;
+gain_out = stored[slot].gain_out;
+capture_cur = stored[slot].capture;
+preset_color = stored[slot].color;
+current_preset = slot;
+current_scene = 0;
+generation++;
+return true;
+}
+
+void initDefaultState() {
+ledcfg["bright"] = "100";
+ledcfg["tuner"] = "needle";
+ledcfg["tap"] = "1";
+ledcfg["meter"] = "edit";
+ledcfg["hold"] = "1";
+ledcfg["anim"] = "1";
+ledcfg["idle"] = "0";
+
+int fsa_1[4] = {4, 9, 7, 3};
+for (int f = 0; f < 4; f++) {
+fsa[String(f) + " 0"] = "1 " + String(f) + " 255";
+fsa[String(f) + " 1"] = String(fsa_1[f]) + " 0 255";
+fsa[String(f) + " 2"] = "0 0 255";
+}
+
+captures[0] = {true, "ESP32 Plexi", 2200};
+captures[1] = {true, "ESP32 JCM800", 2200};
+irs[0] = {true, "4x12 V30 Cab", 2048};
+
+blocks.push_back({next_id++, 'P', "boost", true, defaultParamsFor("boost"), 0});
+blocks.push_back({next_id++, 'P', "overdrive", false, defaultParamsFor("overdrive"), 0});
+blocks.push_back({next_id++, 'Q', "ir", true, defaultParamsFor("ir"), 0});
+blocks.push_back({next_id++, 'Q', "delay", true, defaultParamsFor("delay"), 0});
+blocks.push_back({next_id++, 'Q', "reverb2", true, defaultParamsFor("reverb2"), 0});
+storeCurrent(0, "Clean Demo");
+
+blocks[1].on = true;
+blocks[1].params[0] = 75;
+storeCurrent(1, "Crunch Demo");
+
+applyStored(0);
+}
+
+std::vector<String> splitTokens(const String& line) {
+std::vector<String> out;
+int i = 0, n = line.length();
+while (i < n) {
+while (i < n && isspace(line[i])) i++;
+if (i >= n) break;
+int start = i;
+while (i < n && !isspace(line[i])) i++;
+out.push_back(line.substring(start, i));
+}
+return out;
+}
+
+String joinFrom(const std::vector<String>& t, size_t idx) {
+String res = "";
+for (size_t i = idx; i < t.size(); i++) {
+if (i > idx) res += " ";
+res += t[i];
+}
+return res;
+}
+
+void sendLine(const String& s) {
+Serial.print(s);
+Serial.print("\n");
+}
+
+void handleCommand(const String& rawLine) {
+String line = rawLine;
+line.trim();
+if (line.length() == 0) return;
+
+auto t = splitTokens(line);
+String cmd = t[0];
+
+if (cmd == "PING") {
+sendLine("PONG tankg_fw M5.26 rel amx ble v1 Nov 12 2026 10:00:00");
+}
+else if (cmd == "FXT") {
+sendLine("FXT 1 gate cost=40 cat=dyn");
+sendLine("FXT 0 thresh 0..100 (50)");
+sendLine("FXT 1 release 0..100 (50)");
+sendLine("FXT 2 comp cost=45 cat=dyn");
+sendLine("FXT 0 sustain 0..100 (50)");
+sendLine("FXT 1 attack 0..100 (50)");
+sendLine("FXT 2 level 0..100 (50)");
+sendLine("FXT 3 boost cost=40 cat=drive");
+sendLine("FXT 0 gain 0..100 (50)");
+sendLine("FXT 1 tone 0..100 (50)");
+sendLine("FXT 4 overdrive cost=45 cat=drive");
+sendLine("FXT 0 drive 0..100 (50)");
+sendLine("FXT 1 tone 0..100 (50)");
+sendLine("FXT 2 level 0..100 (50)");
+sendLine("FXT 5 distortion cost=45 cat=drive");
+sendLine("FXT 0 dist 0..100 (50)");
+sendLine("FXT 1 tone 0..100 (50)");
+sendLine("FXT 2 level 0..100 (50)");
+sendLine("FXT 6 chorus cost=45 cat=mod");
+sendLine("FXT 0 rate 0..100 (40)");
+sendLine("FXT 1 depth 0..100 (50)");
+sendLine("FXT 2 mix 0..100 (50)");
+sendLine("FXT 7 ir cost=50 cat=cab");
+sendLine("FXT 0 slot 0..7 (0)");
+sendLine("FXT 1 lowcut 0..100 (50)");
+sendLine("FXT 2 highcut 0..100 (100)");
+sendLine("FXT 3 level 0..100 (50)");
+sendLine("FXT 8 delay cost=50 cat=time");
+sendLine("FXT 0 time 0..100 (35)");
+sendLine("FXT 1 feedback 0..100 (40)");
+sendLine("FXT 2 mix 0..100 (30)");
+sendLine("FXT 3 tone 0..100 (50)");
+sendLine("FXT 9 reverb2 cost=45 cat=time");
+sendLine("FXT 0 decay 0..100 (35)");
+sendLine("FXT 1 tone 0..100 (50)");
+sendLine("FXT 2 mix 0..100 (50)");
+sendLine("FXT end");
+}
+else if (cmd == "FXS") {
+char banks[2] = {'P', 'Q'};
+for (int bi = 0; bi < 2; bi++) {
+char bk = banks[bi];
+int pos = 0;
+for (const auto& b : blocks) {
+if (b.bank != bk) continue;
+String pStr = "";
+for (size_t i = 0; i < b.params.size(); i++) {
+if (i > 0) pStr += ",";
+pStr += String(b.params[i]);
+}
+sendLine("FX " + String(bk) + String(pos) + " id=" + String(b.id) + " " + b.type_name +
+" on=" + String(b.on ? 1 : 0) + " p=" + pStr + " ticks=45 l=" + String(b.lane));
+pos++;
+}
+}
+sendLine("FXS amp=" + String(amp_present ? 1 : 0) + " on=" + String(amp_on ? 1 : 0));
+int64_t used = calcCost();
+sendLine("FXS cpu=" + String((long)used) + "/" + String((long)cpu_budget) + " ticks (" +
+String((long)(used * 100 / cpu_budget)) + "%) mem_fx=1000");
+sendLine("FXS peak=500 ticks skipped=0");
+}
+else if (cmd == "FXA") {
+if (t.size() < 4) { sendLine("ERR FXA bad argument"); return; }
+char bk = t[1][0];
+int pos = t[2].toInt();
+String name = t[3];
+if (bk != 'P' && bk != 'Q') { sendLine("ERR FXA bad argument"); return; }
+Block b = {next_id++, bk, name, true, defaultParamsFor(name), 0};
+int count = 0;
+size_t insertIdx = blocks.size();
+for (size_t i = 0; i < blocks.size(); i++) {
+if (blocks[i].bank == bk) {
+if (count == pos) { insertIdx = i; break; }
+count++;
+insertIdx = i + 1;
+}
+}
+blocks.insert(blocks.begin() + insertIdx, b);
+generation++;
+int64_t used = calcCost();
+sendLine("FXA id=" + String(b.id) + " " + name);
+sendLine("FX cpu=" + String((long)used) + "/" + String((long)cpu_budget) + " ticks (" +
+String((long)(used * 100 / cpu_budget)) + "%) mem_fx=1000");
+}
+else if (cmd == "FXR") {
+uint32_t id = t.size() > 1 ? t[1].toInt() : 0;
+bool removed = false;
+for (size_t i = 0; i < blocks.size(); i++) {
+if (blocks[i].id == id) {
+blocks.erase(blocks.begin() + i);
+removed = true;
+break;
+}
+}
+if (!removed) { sendLine("ERR FXR bad argument"); return; }
+generation++;
+sendLine("FXR ok " + String(id));
+}
+else if (cmd == "FXM") {
+if (t.size() < 4) { sendLine("ERR FXM bad argument"); return; }
+uint32_t id = t[1].toInt();
+char bk = t[2][0];
+int pos = t[3].toInt();
+int found = -1;
+for (size_t i = 0; i < blocks.size(); i++) {
+if (blocks[i].id == id) { found = i; break; }
+}
+if (found < 0) { sendLine("ERR FXM bad argument"); return; }
+Block b = blocks[found];
+blocks.erase(blocks.begin() + found);
+b.bank = bk;
+int count = 0;
+size_t insertIdx = blocks.size();
+for (size_t i = 0; i < blocks.size(); i++) {
+if (blocks[i].bank == bk) {
+if (count == pos) { insertIdx = i; break; }
+count++;
+insertIdx = i + 1;
+}
+}
+blocks.insert(blocks.begin() + insertIdx, b);
+generation++;
+sendLine("FXM ok " + String(id));
+}
+else if (cmd == "FXE") {
+uint32_t id = t.size() > 1 ? t[1].toInt() : 0;
+bool on = t.size() > 2 ? (t[2].toInt() != 0) : true;
+bool found = false;
+for (auto& b : blocks) {
+if (b.id == id) { b.on = on; found = true; break; }
+}
+if (!found) { sendLine("ERR FXE bad argument"); return; }
+generation++;
+int64_t used = calcCost();
+sendLine("FXE ok cpu=" + String((long)used) + "/" + String((long)cpu_budget) + " ticks (" +
+String((long)(used * 100 / cpu_budget)) + "%)");
+}
+else if (cmd == "FXP") {
+if (t.size() < 4) { sendLine("ERR FXP bad argument"); return; }
+uint32_t id = t[1].toInt();
+int idx = t[2].toInt();
+int32_t val = t[3].toInt();
+for (auto& b : blocks) {
+if (b.id == id && idx >= 0 && idx < (int)b.params.size()) {
+b.params[idx] = constrain(val, 0, 100);
+sendLine("FXP ok " + String(b.params[idx]));
+return;
+}
+}
+sendLine("ERR FXP bad argument");
+}
+else if (cmd == "FXL") {
+if (t.size() < 3) { sendLine("ERR FXL bad argument"); return; }
+uint32_t id = t[1].toInt();
+uint8_t lane = t[2].toInt();
+for (auto& b : blocks) {
+if (b.id == id) {
+b.lane = lane;
+generation++;
+sendLine("FXL ok " + String(id) + " " + String(lane));
+return;
+}
+}
+sendLine("ERR FXL bad argument");
+}
+else if (cmd == "AMP") {
+amp_on = t.size() > 1 ? (t[1].toInt() != 0) : true;
+generation++;
+sendLine("AMP " + String(amp_on ? 1 : 0));
+}
+else if (cmd == "AMPX") {
+amp_present = t.size() > 1 ? (t[1].toInt() != 0) : true;
+int p_count = 0;
+for (const auto& b : blocks) if (b.bank == 'P') p_count++;
+sendLine("AMPX " + String(amp_present ? 1 : 0) + " " + String(p_count));
+}
+else if (cmd == "AMPEQ") {
+if (t.size() >= 6) {
+for (int i = 0; i < 5; i++) ampeq[i] = t[i + 1].toInt();
+if (t.size() >= 7) ampeq[5] = t[6].toInt();
+}
+sendLine("AMPEQ volume=" + String(ampeq[0]) + " bass=" + String(ampeq[1]) +
+" mid=" + String(ampeq[2]) + " treble=" + String(ampeq[3]) +
+" presence=" + String(ampeq[4]) + " drive=" + String(ampeq[5]));
+}
+else if (cmd == "PLIST") {
+for (int i = 0; i < 32; i++) {
+if (stored[i].used) {
+String col = stored[i].color.length() > 0 ? (" col=" + stored[i].color) : "";
+sendLine("PRE " + String(i) + " " + String(stored[i].blocks.size()) + " 0 0 '" + stored[i].name + "'" + col);
+      }
+    }
+    sendLine("PLIST end current=" + String(current_preset));
+  }
+  else if (cmd == "PLOAD") {
+    int n = t.size() > 1 ? t[1].toInt() : -1;
+    if (n < 0 || n >= 32 || !applyStored(n)) {
+      sendLine("ERR PLOAD empty or invalid slot");
+      return;
+    }
+    sendLine("PLOAD ok slot=" + String(n) + " missing=0 ms=12");
+  }
+  else if (cmd == "PNEW") {
+    blocks.clear();
+    amp_present = true;
+    amp_on = true;
+    memset(ampeq, 0, sizeof(ampeq));
+    gain_in = 0; gain_out = 0;
+    current_preset = -1;
+    current_scene = -1;
+    preset_color = "";
+    generation++;
+    sendLine("PNEW ok");
+  }
+  else if (cmd == "PSAVE") {
+    int slot = t.size() > 1 ? t[1].toInt() : -1;
+    if (slot < 0 || slot >= 32) { sendLine("ERR PSAVE bad slot"); return; }
+    String name = joinFrom(t, 2);
+    storeCurrent(slot, name);
+    sendLine("PSAVE ok slot=" + String(slot) + " capture=" + String(capture_cur));
+  }
+  else if (cmd == "PCOLOR") {
+    String c = t.size() > 1 ? t[1] : "none";
+    preset_color = (c == "none") ? "" : c;
+    sendLine("PCOLOR " + c + " preset=" + String(current_preset));
+  }
+  else if (cmd == "SNAPS") {
+    sendLine("SNAPS 0000 current=" + String(current_scene));
+  }
+  else if (cmd == "SNAPNAME") {
+    int p = max(0, (int)current_preset);
+    if (t.size() >= 3) {
+      int n = t[1].toInt();
+      if (n >= 0 && n < 4) {
+        String name = joinFrom(t, 2);
+        stored[p].scene_names[n] = name;
+        sendLine("SNAPNAME ok " + String(n) + " '" + name + "' preset=" + String(current_preset));
+      } else {
+        sendLine("ERR SNAPNAME bad argument");
+      }
+    } else {
+      for (int i = 0; i < 4; i++) {
+        sendLine("SNAPNAME " + String(i) + " '" + stored[p].scene_names[i] + "'");
+      }
+      sendLine("SNAPNAME end");
+    }
+  }
+  else if (cmd == "TUNER") {
+    if (t.size() >= 2) {
+      tuner_on = (t[1].toInt() == 1);
+      if (t.size() >= 3) tuner_mute = (t[2].toInt() == 1);
+      if (t.size() >= 4) tuner_ref = t[3].toInt();
+    }
+    sendLine("TUNER " + String(tuner_on ? 1 : 0) + " mute=" + String(tuner_mute ? 1 : 0) + " ref=" + String(tuner_ref));
+  }
+  else if (cmd == "TUNE") {
+    if (!tuner_on) {
+      sendLine("TUNE off");
+    } else {
+      const char* notes[6] = {"E2", "A2", "D3", "G3", "B3", "E4"};
+      const float freqs[6] = {82.41f, 110.00f, 146.83f, 196.00f, 246.94f, 329.63f};
+      tune_tick++;
+      int idx = (tune_tick / 20) % 6;
+      float cents = ((int)(tune_tick % 20) - 10) * 1.5f;
+      char buf[96];
+      snprintf(buf, sizeof(buf), "TUNE %s hz=%.2f cents=%+.1f level=-210 ons=%u",
+               notes[idx], freqs[idx], cents, tune_tick / 20);
+      sendLine(String(buf));
+    }
+  }
+  else if (cmd == "GAIN") {
+    if (t.size() >= 3) {
+      gain_in = t[1].toInt();
+      gain_out = t[2].toInt();
+    }
+    sendLine("GAIN in=" + String(gain_in) + " out=" + String(gain_out) + " dB");
+  }
+  else if (cmd == "LVL") {
+    int64_t used = calcCost();
+    sendLine("LVL in=-300 out=-250 ci=0 co=0 fx=" + String((long)used) + "/" + String((long)cpu_budget) +
+             " mem=1 sk=0 m=" + String(audio_mode) + " g=0/0 a=" + String(amp_on ? 1 : 0) +
+             " e=1/2 s=" + String(current_scene) + " c=" + String(generation) + " p=" + String(current_preset));
+  }
+  else if (cmd == "MODEL") {
+    String n = (capture_cur >= 0 && capture_cur < 15 && captures[capture_cur].used) ? captures[capture_cur].name : "";
+    sendLine("MODEL '" + n + "' layers=10 engine=A2L");
+  }
+  else if (cmd == "CLIST") {
+    for (int i = 0; i < 15; i++) {
+      if (captures[i].used) {
+        sendLine("CAP " + String(i) + " " + String(captures[i].size) + " '" + captures[i].name + "'");
+      }
+    }
+    sendLine("CLIST end current=" + String(capture_cur) + " slots=15");
+  }
+  else if (cmd == "ILIST") {
+    for (int i = 0; i < 8; i++) {
+      if (irs[i].used) {
+        sendLine("IRS " + String(i) + " " + String(irs[i].size) + " '" + irs[i].name + "' fs=48");
+      }
+    }
+    sendLine("ILIST end current=-1 slots=8");
+  }
+  else if (cmd == "AUDIO") {
+    audio_mode = (t.size() > 1 && t[1] == "OFF") ? 0 : 2;
+    sendLine("AUDIO " + String(audio_mode));
+  }
+  else if (cmd == "LDBEGIN" || cmd == "IRBEGIN") {
+    size_t n = t.size() > 1 ? t[1].toInt() : 0;
+    if (n == 0) {
+      staging = false;
+      sendLine("OK " + cmd + " 0");
+    } else {
+      staging = true;
+      stage_kind = (cmd == "LDBEGIN") ? 'C' : 'I';
+      stage_expected = (cmd == "IRBEGIN") ? (n * 2) : n;
+      stage_received = 0;
+      stage_crc = 0xFFFFFFFF;
+      sendLine("OK " + cmd + " " + String(n));
+    }
+  }
+  else if (cmd == "LDB" || cmd == "IRB") {
+    if (!staging || t.size() < 3) { sendLine("ERR " + cmd + " no upload"); return; }
+    size_t off = t[1].toInt();
+    String hex = t[2];
+    size_t blen = hex.length() / 2;
+    for (size_t i = 0; i < blen; i++) {
+      uint8_t b = (uint8_t)strtol(hex.substring(2 * i, 2 * i + 2).c_str(), nullptr, 16);
+      stage_crc = crc32_update(stage_crc, &b, 1);
+    }
+    stage_received += blen;
+    sendLine("OK " + cmd + " " + String(off) + " " + String(blen));
+  }
+  else if (cmd == "LDEND" || cmd == "IREND") {
+    if (!staging) { sendLine("ERR " + cmd + " no upload"); return; }
+    staging = false;
+    uint32_t final_crc = stage_crc ^ 0xFFFFFFFF;
+    char crcHex[16];
+    snprintf(crcHex, sizeof(crcHex), "%08x", final_crc);
+    if (t.size() < 2 || t[1] != String(crcHex) || stage_received != stage_expected) {
+      sendLine("ERR " + cmd + " crc mismatch");
+      return;
+    }
+    if (cmd == "LDEND") {
+      last_blob_size = stage_received;
+      sendLine("LOAD rc=0 name='esp32' layers=10 channels=3 audio=" + String(audio_mode) + " engine=A2L ms=5");
+    } else {
+      last_ir_size = stage_received;
+      sendLine("IR ok " + String(stage_received / 2) + " samples gain 0 mdB fs 48");
+    }
+  }
+  else if (cmd == "CSAVE") {
+    int slot = t.size() > 1 ? t[1].toInt() : -1;
+    if (slot < 0 || slot >= 15) { sendLine("ERR CSAVE bad slot"); return; }
+    String name = joinFrom(t, 2);
+    captures[slot] = {true, name, last_blob_size};
+    sendLine("CSAVE ok " + String(slot) + " '" + name + "' " + String(last_blob_size) + " B");
+  }
+  else if (cmd == "ISAVE") {
+    int slot = t.size() > 1 ? t[1].toInt() : -1;
+    if (slot < 0 || slot >= 8) { sendLine("ERR ISAVE bad slot"); return; }
+    String name = joinFrom(t, 2);
+    irs[slot] = {true, name, last_ir_size};
+    sendLine("ISAVE ok " + String(slot) + " '" + name + "' " + String(last_ir_size / 2) + " samples fs=48");
+  }
+  else if (cmd == "CDEL" || cmd == "IDEL") {
+    int slot = t.size() > 1 ? t[1].toInt() : -1;
+    if (cmd == "CDEL" && slot >= 0 && slot < 15) captures[slot].used = false;
+    else if (cmd == "IDEL" && slot >= 0 && slot < 8) irs[slot].used = false;
+    else { sendLine("ERR " + cmd + " invalid slot"); return; }
+    sendLine(cmd + " ok " + String(slot));
+  }
+  else if (cmd == "CLOAD") {
+    int slot = t.size() > 1 ? t[1].toInt() : -1;
+    if (slot < 0 || slot >= 15 || !captures[slot].used) { sendLine("ERR CLOAD invalid"); return; }
+    capture_cur = slot;
+    sendLine("CLOAD ok " + String(slot) + " audio=" + String(audio_mode));
+  }
+  else if (cmd == "ILOAD" || cmd == "FXIR") {
+    sendLine(cmd + " ok " + (t.size() > 1 ? t[1] : "0"));
+  }
+  else if (cmd == "HPF") {
+    if (t.size() > 1) hpf = t[1].toInt();
+    sendLine("HPF hz=" + String(hpf));
+  }
+  else if (cmd == "LEDCFG") {
+    for (size_t i = 1; i < t.size(); i++) {
+      int eq = t[i].indexOf('=');
+      if (eq > 0) ledcfg[t[i].substring(0, eq)] = t[i].substring(eq + 1);
+    }
+    String body = "";
+    for (const auto& kv : ledcfg) {
+      if (body.length() > 0) body += " ";
+      body += kv.first + "=" + kv.second;
+    }
+    sendLine("LEDCFG " + body);
+  }
+  else if (cmd == "FSMODE") {
+    if (t.size() > 1 && t[1].startsWith("layout=")) fsmode = t[1].substring(7);
+    sendLine("FSMODE layout=" + fsmode + " mode=preset bank=1 bypass=0");
+  }
+  else if (cmd == "FSA") {
+    if (t.size() >= 4) {
+      fsa[t[1] + " " + t[2]] = joinFrom(t, 3);
+      sendLine("FSA " + t[1] + " " + t[2] + " " + joinFrom(t, 3));
+    } else {
+      for (const auto& kv : fsa) sendLine("FSA " + kv.first + " " + kv.second);
+      sendLine("FSA end");
+    }
+  }
+  else if (cmd == "FSLED") {
+    if (t.size() >= 3) {
+      int f = constrain((int)t[1].toInt(), 0, 3);
+      if (t[2] == "auto") fsled[f].custom = false;
+      else {
+        fsled[f].custom = true;
+        fsled[f].on_col = t[2];
+        fsled[f].off_col = t.size() > 3 ? t[3] : "000000";
+      }
+      sendLine("FSLED " + String(f) + " " + (fsled[f].custom ? "custom" : "auto") +
+               " on=" + fsled[f].on_col + " off=" + fsled[f].off_col);
+    } else {
+      for (int f = 0; f < 4; f++) {
+        sendLine("FSLED " + String(f) + " " + (fsled[f].custom ? "custom" : "auto") +
+                 " on=" + fsled[f].on_col + " off=" + fsled[f].off_col);
+      }
+      sendLine("FSLED end");
+    }
+  }
+  else if (cmd == "GEQ") {
+    if (t.size() >= 3) {
+      int band = constrain((int)t[1].toInt(), 0, 5);
+      geq[band] = t[2].toInt();
+      sendLine("GEQ " + String(band) + " " + String(geq[band]));
+    } else {
+      sendLine("GEQ " + String(geq[0]) + " " + String(geq[1]) + " " + String(geq[2]) +
+               " " + String(geq[3]) + " " + String(geq[4]));
+    }
+  }
+  else if (cmd == "GSAVE") {
+    sendLine("GSAVE ok");
+  }
+  else {
+    sendLine("ERR " + cmd + " unknown command");
+  }
+}
+
+String rxBuf = "";
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setRxBufferSize(2048);
+  initDefaultState();
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      handleCommand(rxBuf);
+      rxBuf = "";
+    } else if (c != '\r') {
+      rxBuf += c;
+    }
+  }
+}

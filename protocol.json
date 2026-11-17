@@ -1,9 +1,9 @@
 {
   "document": {
-    "title": "Tank-G / Tank-B UltraRig firmware: host <-> pedal control protocol",
+    "title": "Tank-G / Tank-B text-protocol firmware: host <-> pedal control protocol",
     "purpose": "Clean technical description of the wire protocol observed in the control page (web/tankg.html, web/nam2chip.js). No source, UI text or assets reproduced.",
     "scope_notes": [
-      "Applies to the alternative firmware (UltraRig, firmware tag 'M5.x'). The factory M-VAVE firmware uses USB-MIDI/USB-audio instead and is NOT covered by this protocol.",
+      "Applies to the alternative text-protocol firmwares (firmware tag 'M5.x', including the open firmware in firmware-tankg/). The factory M-VAVE firmware uses USB-MIDI/USB-audio instead and is NOT covered by this protocol.",
       "Derived by static reading of the page; nothing was executed against a real pedal. Effect table comes from the page's built-in reference catalog (ids 1..39); the pedal itself is the authority and returns its own table with the FXT command (see effects.runtime_discovery).",
       "Field meanings marked '(unverified)' are inferred from how the page parses them."
     ]
@@ -11,6 +11,9 @@
   "transport": {
     "type": "USB CDC-ACM virtual serial port, accessed via the Web Serial API (no SysEx, no MIDI)",
     "usb_vendor_id": "0x3654",
+    "usb_extra_ids": [
+      {"vid": "0x1209", "pid": "0x0001", "note": "Open firmware for the Tank-G (firmware-tankg, built on felucca-bsp): enumerates as Hugelton Instruments \"Felucca\", pid.codes test VID/PID. Same text protocol; PING answers PONG tankg_fw."}
+    ],
     "usb_product_id": "not filtered by the page (any PID with vendor 0x3654; the page stores the last vid/pid it used and prefers it on reconnect)",
     "serial_settings": {
       "baud_rate": 115200,

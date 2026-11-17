@@ -10,6 +10,8 @@
 //! 5. pack little-endian + CRC32 and re-validate with the firmware's shift rules.
 
 use crate::nam::NamInfo;
+
+mod distill;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -42,6 +44,45 @@ pub struct ConvertOptions {
     pub signals: Option<Vec<Vec<f64>>>,
     /// Extra margin multiplied onto measured ranges (default 1.5 for the built-in signal, 1 otherwise).
     pub guard: Option<f64>,
+    /// What the pedal's capture player can take (from its `CAPS` reply). When the capture is heavier it is compacted (distilled) into a
+    /// smaller network first. `None` = no limit (stock firmware): the Lite network is quantised as it is.
+    pub budget: Option<Budget>,
+    /// Training steps of the compaction (default 8000, about a minute on one core). More = closer to the original, slower.
+    pub distill_steps: Option<usize>,
+    /// Prefer the largest student that fits the budget instead of the lightest one.
+    pub prefer_quality: bool,
+    /// Called during the compaction (it takes a minute or two).
+    pub progress: Option<DistillProgress>,
+}
+
+impl Budget {
+    /// From the open Tank-G firmware's `CAPS a2l_macs=<n> ... a2l_blob=<n> ...` reply. `None` for anything else (stock firmware: no limit known).
+    pub fn from_caps(line: &str) -> Option<Budget> {
+        let mut it = line.split_whitespace();
+        if it.next() != Some("CAPS") { return None; }
+        let (mut m, mut b) = (None, None);
+        for kv in it {
+            if let Some(v) = kv.strip_prefix("a2l_macs=") { m = v.parse().ok(); }
+            if let Some(v) = kv.strip_prefix("a2l_blob=") { b = v.parse().ok(); }
+        }
+        Some(Budget { max_macs: m?, max_bytes: b? })
+    }
+}
+
+/// Progress callback of the compaction: (step, total steps, running error estimate).
+#[derive(Clone)]
+pub struct DistillProgress(pub std::sync::Arc<dyn Fn(usize, usize, f64) + Send + Sync>);
+impl std::fmt::Debug for DistillProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("DistillProgress") }
+}
+
+/// Limits of a pedal's A2L player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Budget {
+    /// multiply-accumulates per sample
+    pub max_macs: usize,
+    /// blob size the pedal can keep in a slot
+    pub max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +95,15 @@ pub struct ConvertStats {
     pub sample_rate: u32,
     pub bytes: usize,
     pub calib_samples: usize,
+    /// The capture did not fit the pedal's budget and was compacted into a smaller network.
+    #[serde(default)]
+    pub compacted: bool,
+    /// MACs per sample of the network in the file (before compaction).
+    #[serde(default)]
+    pub source_macs: usize,
+    /// Error-to-signal ratio of the compacted network against the original on the training signals (0 = identical).
+    #[serde(default)]
+    pub esr: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -832,13 +882,23 @@ pub fn convert_str(text: &str, opts: &ConvertOptions) -> Result<ConvertOutput, C
             "Esta captura é de {sr} Hz; a pedaleira roda a 48 kHz. Baixe a versão 48 kHz."
         ));
     }
-    let e = build_engine(sub)?;
-    let macs = CH
-        + e.layers
-            .iter()
-            .map(|l| l.conv_w.len() + l.mix_w.len() + l.l1_w.len())
-            .sum::<usize>()
-        + e.head_w.len();
+    let mut e = build_engine(sub)?;
+    let source_macs = distill::engine_macs(&e);
+    let (mut compacted, mut esr) = (false, None);
+    if let Some(b) = opts.budget {
+        let ks: Vec<usize> = e.layers.iter().map(|l| l.k).collect();
+        if source_macs > b.max_macs || blob_size(CH, e.head_k, &ks) > b.max_bytes {
+            let Some((dil, k, hk)) = distill::pick_shape(b.max_macs, b.max_bytes, opts.prefer_quality) else {
+                return bad(format!("A pedaleira aceita no máximo {} operações por amostra / {} bytes por captura: nenhum modelo compacto cabe nisso.", b.max_macs, b.max_bytes));
+            };
+            let noop = |_: usize, _: usize, _: f64| {};
+            let d = distill::distill(&e, dil, k, hk, opts.distill_steps.unwrap_or(8000), opts.progress.as_ref().map(|p| p.0.as_ref() as &dyn Fn(usize, usize, f64)).unwrap_or(&noop));
+            e = d.engine;
+            compacted = true;
+            esr = Some(d.esr);
+        }
+    }
+    let macs = distill::engine_macs(&e);
 
     let signals = opts
         .signals
@@ -882,6 +942,9 @@ pub fn convert_str(text: &str, opts: &ConvertOptions) -> Result<ConvertOutput, C
             sample_rate: FS,
             bytes: blob.len(),
             calib_samples,
+            compacted,
+            source_macs,
+            esr,
         },
         blob,
         name,

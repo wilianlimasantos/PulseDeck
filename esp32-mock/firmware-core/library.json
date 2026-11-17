@@ -1,0 +1,6 @@
+{
+  "name": "firmware-core",
+  "version": "0.1.0",
+  "description": "Chip-independent pedal engine: protocol parser, presets/scenes, footswitch FSM, CRC32, CPU/RAM budget",
+  "build": { "srcDir": "src", "includeDir": "include", "flags": ["-Iinclude"] }
+}
